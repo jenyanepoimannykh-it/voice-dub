@@ -560,6 +560,24 @@ def choose_text_for_duration(options: list[str], duration: float, language: str)
     return min(estimates, key=lambda item: item[1])[0]
 
 
+def plan_timeline_variants(cues: list[Cue], options: list[list[str]], language: str) -> list[str]:
+    """Choose variants jointly, avoiding estimated overlap and oversized gaps."""
+    selected = [choose_text_for_duration(items, cue.end - cue.start, language)
+                for cue, items in zip(cues, options)]
+    for i in range(len(cues) - 1):
+        current = estimated_spoken_duration(selected[i], language)
+        gap = cues[i + 1].start - (cues[i].start + current)
+        if gap < 0:
+            fitting = [t for t in options[i] if estimated_spoken_duration(t, language) < current]
+            if fitting:
+                selected[i] = max(fitting, key=lambda t: estimated_spoken_duration(t, language))
+        elif gap > 0.5:
+            longer = [t for t in options[i] if estimated_spoken_duration(t, language) <= cues[i].end - cues[i].start]
+            if longer:
+                selected[i] = max(longer, key=lambda t: estimated_spoken_duration(t, language))
+    return selected
+
+
 def candidate_score(candidate: Candidate) -> float:
     """Balance timing, identity, pauses, and collisions on comparable scales."""
     return (
@@ -826,6 +844,7 @@ def run(args: argparse.Namespace) -> Path:
             device,
             args.translation_variants,
         )
+    planned_texts = plan_timeline_variants(cues, cue_text_options, args.language)
 
     captions_output = None
     has_curated_variants = any(len(options) > 1 for options in cue_text_options)
@@ -947,7 +966,7 @@ def run(args: argparse.Namespace) -> Path:
             source_chunk_count = sum(
                 end > cue.start and start < cue.end for start, end in intervals
             )
-            text_options = cue_text_options[number - 1]
+            text_options = [planned_texts[number - 1]]
             if len(text_options) > 1:
                 selected_text = choose_text_for_duration(
                     text_options, original_voice_duration, args.language
