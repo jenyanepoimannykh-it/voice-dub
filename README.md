@@ -67,6 +67,10 @@ This setup is exhausting. || Setting everything up takes a lot out of you.
 
 Run `voice-dub --help` for all controls or `voice-dub --list-languages` for supported languages.
 
+For GPT-assisted translation with explicit short, baseline, and long alternatives, use
+[`TRANSLATION_PROMPT.md`](TRANSLATION_PROMPT.md). Separate alternatives with ` || ` so the
+pre-synthesis duration selector can choose one wording without generating multiple takes.
+
 Every generation appends a JSON Lines record to `voice-dub-runs.jsonl` beside the output. Records include settings, device, total and per-candidate generation time, timing error, pause mismatch, voice similarity, overlap risk, selected wording, score, output size, and failure details. Use `--run-log PATH` to choose another history file.
 
 ## Test
