@@ -1,0 +1,48 @@
+# Local environments and secrets
+.venv/
+venv/
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Python caches and build artifacts
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+build/
+dist/
+
+# Editors and operating-system metadata
+.DS_Store
+.idea/
+.vscode/
+
+# Local input/output media and caption artifacts
+*.wav
+*.mp3
+*.m4a
+*.aac
+*.flac
+*.mp4
+*.mov
+*.mkv
+*.webm
+*.avi
+*.jpg
+*.jpeg
+*.png
+*.gif
+*.webp
+*.heic
+*.srt
+*.sbv
+
+# Model and application caches
+.cache/
+models/
+checkpoints/

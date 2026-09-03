@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "voice-dub"
+version = "0.1.0"
+description = "Clone a reference voice and speak translated text with Chatterbox Multilingual V3"
+readme = "README.md"
+requires-python = ">=3.10,<3.14"
+dependencies = [
+  # V3 currently lives on the official Chatterbox main branch.
+  "chatterbox-tts @ git+https://github.com/resemble-ai/chatterbox.git@master",
+  "sentencepiece>=0.2,<0.3",
+]
+
+[project.scripts]
+voice-dub = "voice_dub.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
