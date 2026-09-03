@@ -340,12 +340,18 @@ def align_internal_pauses(
         for previous, current in zip(source_chunks, source_chunks[1:])
     )
     source_gaps.append(max(0.0, cue.end - source_chunks[-1][1]))
-    gap_total = sum(source_gaps)
-    if gap_total <= 1e-6:
+    internal_gaps = source_gaps[1:-1]
+    # Ignore detector-scale dips; only align clearly audible pauses.
+    if not any(gap >= 0.28 for gap in internal_gaps):
         return None
 
-    gap_samples = [round(spare_samples * gap / gap_total) for gap in source_gaps]
-    gap_samples[-1] += spare_samples - sum(gap_samples)
+    internal_samples = [round(gap * sample_rate) for gap in internal_gaps]
+    internal_total = sum(internal_samples)
+    if internal_total > spare_samples:
+        scale = spare_samples / internal_total
+        internal_samples = [round(value * scale) for value in internal_samples]
+    edge_samples = spare_samples - sum(internal_samples)
+    gap_samples = [edge_samples // 2, *internal_samples, edge_samples - edge_samples // 2]
     aligned = np.zeros(slot_samples, dtype=np.float32)
     cursor = gap_samples[0]
     for index, chunk in enumerate(generated_chunks):
