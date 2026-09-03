@@ -189,6 +189,11 @@ class CliTests(unittest.TestCase):
         target = estimated_spoken_duration(options[1], "en")
         self.assertEqual(choose_text_for_duration(options, target, "en"), options[1])
 
+    def test_duration_selection_never_prefers_overlong_wording(self):
+        options = ["A very long wording that exceeds the available window.", "Short wording."]
+        selected = choose_text_for_duration(options, 1.5, "en")
+        self.assertEqual(selected, "Short wording.")
+
     def test_translation_duration_is_source_calibrated(self):
         source = "Это короткая фраза."
         target = "This is a short phrase."

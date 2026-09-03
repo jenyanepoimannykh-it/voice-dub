@@ -546,8 +546,18 @@ def estimated_translation_duration(
 
 
 def choose_text_for_duration(options: list[str], duration: float, language: str) -> str:
-    """Preselect the wording whose estimated spoken length best matches the source."""
-    return min(options, key=lambda text: abs(estimated_spoken_duration(text, language) - duration))
+    """Choose a non-overlong wording, accepting up to one second of spare time."""
+    estimates = [(text, estimated_spoken_duration(text, language)) for text in options]
+    # Prefer the first semantically-ranked wording that fits or is only slightly
+    # short. This preserves editorial ordering while avoiding overrun.
+    acceptable = [item for item in estimates if 0.0 <= duration - item[1] <= 1.0]
+    if acceptable:
+        return acceptable[0][0]
+    # If every wording is too long, use the shortest one as a safe fallback.
+    under = [item for item in estimates if item[1] <= duration]
+    if under:
+        return max(under, key=lambda item: item[1])[0]
+    return min(estimates, key=lambda item: item[1])[0]
 
 
 def candidate_score(candidate: Candidate) -> float:
@@ -598,7 +608,15 @@ def placement_start(
             # this cue clear of prior speech; the next cue can shift later.
             base = max(base, earliest)
     else:
-        base = max(base, earliest)
+        # Keep the final cue inside the source duration when possible. If it is
+        # longer than its slot, move it earlier rather than letting ffmpeg's
+        # `-shortest` cut off the end of the phrase.
+        latest_for_end = cue.end - generated_samples / sample_rate
+        if latest_for_end >= 0:
+            base = min(base, latest_for_end)
+        base = max(base, 0.0)
+        if base >= earliest:
+            base = max(base, earliest)
     return round(base * sample_rate)
 
 
