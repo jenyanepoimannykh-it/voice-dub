@@ -1108,6 +1108,14 @@ def run(args: argparse.Namespace) -> Path:
                         file=sys.stderr,
                     )
             should_stretch = args.fit == "stretch"
+            # Last resort before allowing an overlap: speed up a take by at
+            # most 5%. Variant selection and placement are preferred first.
+            if args.fit == "natural" and len(generated) > round(available * sample_rate):
+                speed = min(1.05, len(generated) / max(available * sample_rate, 1))
+                if speed > 1.0:
+                    generated = librosa.effects.time_stretch(generated, rate=speed)
+                    cue_metrics["last_resort_speedup"] = round(speed, 4)
+                    print(f"  last resort: sped up take by {(speed - 1) * 100:.1f}% before overlap", file=sys.stderr)
             if should_stretch and len(generated) != slot_samples:
                 rate = len(generated) / slot_samples
                 print(
