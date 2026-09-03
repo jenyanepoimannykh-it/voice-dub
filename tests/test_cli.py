@@ -5,6 +5,7 @@ import unittest
 from voice_dub.cli import (
     Cue, active_duration, align_internal_pauses, build_parser, choose_device,
     clean_pause_noise, extract_text_options, format_sbv, parse_timed_text,
+    speech_only_reference,
     refine_cue_timing,
 )
 
@@ -89,6 +90,17 @@ class CliTests(unittest.TestCase):
         self.assertTrue(np.all(cleaned[300:700] == 0.0))
         self.assertLess(cleaned[100], cleaned[105])
         self.assertLess(cleaned[295], cleaned[290])
+
+    def test_speech_only_reference_removes_long_gaps(self):
+        import numpy as np
+
+        waveform = np.arange(1000, dtype=np.float32)
+        reference = speech_only_reference(
+            waveform, 1000, [(0.1, 0.2), (0.8, 0.9)], np, max_seconds=1.0
+        )
+        self.assertEqual(len(reference), 360)
+        self.assertEqual(reference[0], 100.0)
+        self.assertEqual(reference[100], 0.0)
 
     def test_parses_srt_style_timed_text(self):
         cues = parse_timed_text(

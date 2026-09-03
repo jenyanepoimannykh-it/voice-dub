@@ -40,7 +40,7 @@ voice-dub source.mp4 \
   --output dubbed.mp4
 ```
 
-For better cloning, supply a clean 6–10 second voice-only recording and retain lossless audio:
+The app automatically builds a speech-only conditioning prompt from waveform-detected speech. For the closest clone, supply your own clean 6–10 second voice-only recording and retain lossless audio:
 
 ```bash
 voice-dub source.mp4 \

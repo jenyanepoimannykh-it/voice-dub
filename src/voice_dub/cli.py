@@ -387,6 +387,38 @@ def clean_pause_noise(
     return cleaned
 
 
+def speech_only_reference(
+    waveform: object,
+    sample_rate: int,
+    intervals: list[tuple[float, float]],
+    np: object,
+    max_seconds: float = 10.0,
+) -> object:
+    """Concatenate voiced regions for a cleaner speaker-conditioning prompt."""
+    pieces: list[object] = []
+    silence = np.zeros(round(0.08 * sample_rate), dtype=np.float32)
+    total = 0
+    limit = round(max_seconds * sample_rate)
+    for start, end in intervals:
+        left = max(0, round(start * sample_rate))
+        right = min(len(waveform), round(end * sample_rate))
+        if right <= left:
+            continue
+        piece = waveform[left:right]
+        if total + len(piece) > limit:
+            piece = piece[: max(0, limit - total)]
+        if len(piece):
+            pieces.append(piece)
+            total += len(piece)
+        if total >= limit:
+            break
+        pieces.append(silence)
+        total += len(silence)
+    if not pieces:
+        return waveform
+    return np.concatenate(pieces)[:limit].astype(np.float32, copy=False)
+
+
 def active_duration(cue: Cue, intervals: list[tuple[float, float]]) -> float:
     """Measure voiced time inside a cue, excluding detected pauses."""
     return sum(
@@ -569,6 +601,17 @@ def run(args: argparse.Namespace) -> Path:
                     )
             if captions_output is not None:
                 captions_output.write_text(format_sbv(cues), encoding="utf-8")
+            if not args.voice_reference and intervals:
+                reference_audio = speech_only_reference(
+                    source_waveform, source_rate, intervals, np
+                )
+                reference_wav = Path(directory) / "speech-reference.wav"
+                torchaudio.save(
+                    str(reference_wav),
+                    torch.from_numpy(reference_audio).unsqueeze(0),
+                    source_rate,
+                )
+                print("Using speech-only audio for voice conditioning.", file=sys.stderr)
         model.prepare_conditionals(str(reference_wav), exaggeration=args.exaggeration)
         sample_rate = model.sr
         timeline = np.zeros(round(cues[-1].end * sample_rate), dtype=np.float32)
