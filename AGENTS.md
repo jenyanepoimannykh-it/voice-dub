@@ -5,3 +5,19 @@
 - Keep all temporary files, intermediate audio, generated subtitles, run logs, and other task artifacts inside this project directory.
 - Do not use `/private/tmp`, `/tmp`, or any other external temporary directory for this project.
 - Prefer a clearly named project-local directory such as `.work/` for transient files; do not commit transient files unless explicitly requested.
+
+## Subtitle timing and variant fallback
+
+- Treat the original cue starts and ends as the primary timing reference.
+- Prefer a translation variant whose generated speech fits the cue without creating an artificial gap.
+- If a generated line overlaps the next line, go back to the previous affected cue and try a shorter
+  available `||` variant; recalculate placements after the change.
+- If a generated line leaves an artificial gap greater than 0.5 seconds where the original has no
+  comparable gap, go back to the previous affected cue and try a longer available `||` variant;
+  recalculate placements after the change.
+- A line is regenerated only when the measured result violates these overlap/gap restrictions. Do not
+  synthesize extra variants speculatively when the current placement satisfies them.
+- Before permitting overlap, exhaust shorter variants and then allow at most a 5% speed-up as a final
+  fallback. Overlap is the last resort.
+- Never cut off the final phrase at the video boundary. Shift it earlier when possible; use overlap only
+  when no non-overlapping placement or acceptable variant can preserve the ending.
