@@ -35,6 +35,8 @@ voice-dub source.mp4 \
   --text-file captions.ru.sbv \
   --source-language ru \
   --language en \
+  --translation-variants 3 \
+  --accent american \
   --output dubbed.mp4
 ```
 
@@ -50,7 +52,13 @@ voice-dub source.mp4 \
   --output dubbed.mp4
 ```
 
-By default, waveform analysis refines caption timing, speech may be up to 25% shorter than the source, and shorter phrases are centered in their original windows. Speech is never stretched or cut unless explicitly requested.
+By default, automatic translation evaluates three wordings per line. Waveform analysis refines caption timing, matches safe intra-line pauses, permits speech up to 25% shorter than the source, and centers remaining space. Spoken audio is never stretched or cut unless explicitly requested. Use `--pause-alignment off` to disable pause matching.
+
+For editorial control, put curated alternatives in one cue separated by ` || `. The selected wording is written to the output SBV:
+
+```text
+This setup is exhausting. || Setting everything up takes a lot out of you.
+```
 
 Run `voice-dub --help` for all controls or `voice-dub --list-languages` for supported languages.
 

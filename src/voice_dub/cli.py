@@ -64,6 +64,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="caption language; when different from --language, translate captions first",
     )
     parser.add_argument(
+        "--translation-variants", type=int, default=3,
+        help="alternative translations evaluated per cue (default: 3)",
+    )
+    parser.add_argument(
         "--output", "-o", type=Path, default=Path("dubbed.wav"),
         help="output WAV, or a video to retain the input picture (default: dubbed.wav)",
     )
@@ -72,9 +76,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="also save the generated audio as lossless WAV",
     )
     parser.add_argument("--device", choices=("auto", "cuda", "mps", "cpu"), default="auto")
-    parser.add_argument("--exaggeration", type=float, default=0.5, help="emotion strength (default: 0.5)")
-    parser.add_argument("--cfg-weight", type=float, default=0.5, help="voice/pacing guidance (default: 0.5)")
-    parser.add_argument("--temperature", type=float, default=0.8, help="generation randomness (default: 0.8)")
+    parser.add_argument("--exaggeration", type=float, default=0.4, help="emotion strength (default: 0.4)")
+    parser.add_argument("--cfg-weight", type=float, help="voice/pacing guidance (automatic by default)")
+    parser.add_argument("--temperature", type=float, default=0.7, help="generation randomness (default: 0.7)")
+    parser.add_argument(
+        "--accent", choices=("auto", "american"), default="auto",
+        help="target pronunciation preset; american is available for English",
+    )
     parser.add_argument("--seed", type=int, help="optional reproducible random seed")
     parser.add_argument(
         "--candidates", type=int, default=1,
@@ -95,6 +103,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--placement", choices=("center", "start"), default="center",
         help="place shorter speech within its source window (default: center)",
+    )
+    parser.add_argument(
+        "--pause-alignment", choices=("source", "off"), default="source",
+        help="match generated intra-line pauses to source speech pauses (default: source)",
     )
     parser.add_argument(
         "--fit", choices=("natural", "stretch", "trim"), default="natural",
@@ -292,6 +304,57 @@ def refine_cue_timing(
     return result
 
 
+def align_internal_pauses(
+    waveform: object,
+    sample_rate: int,
+    cue: Cue,
+    source_intervals: list[tuple[float, float]],
+    generated_intervals: list[tuple[float, float]],
+    np: object,
+) -> object | None:
+    """Rebuild a cue by preserving speech chunks and redistributing only silence."""
+    source_chunks = [
+        (max(cue.start, start), min(cue.end, end))
+        for start, end in source_intervals
+        if end > cue.start and start < cue.end
+    ]
+    if len(source_chunks) < 2 or len(source_chunks) != len(generated_intervals):
+        return None
+
+    generated_chunks = [
+        waveform[
+            max(0, round(start * sample_rate)):
+            min(len(waveform), round(end * sample_rate))
+        ]
+        for start, end in generated_intervals
+    ]
+    slot_samples = max(1, round((cue.end - cue.start) * sample_rate))
+    speech_samples = sum(len(chunk) for chunk in generated_chunks)
+    spare_samples = slot_samples - speech_samples
+    if spare_samples < 0:
+        return None
+
+    source_gaps = [max(0.0, source_chunks[0][0] - cue.start)]
+    source_gaps.extend(
+        max(0.0, current[0] - previous[1])
+        for previous, current in zip(source_chunks, source_chunks[1:])
+    )
+    source_gaps.append(max(0.0, cue.end - source_chunks[-1][1]))
+    gap_total = sum(source_gaps)
+    if gap_total <= 1e-6:
+        return None
+
+    gap_samples = [round(spare_samples * gap / gap_total) for gap in source_gaps]
+    gap_samples[-1] += spare_samples - sum(gap_samples)
+    aligned = np.zeros(slot_samples, dtype=np.float32)
+    cursor = gap_samples[0]
+    for index, chunk in enumerate(generated_chunks):
+        end = min(slot_samples, cursor + len(chunk))
+        aligned[cursor:end] = chunk[:end - cursor]
+        cursor = end + gap_samples[index + 1]
+    return aligned
+
+
 def active_duration(cue: Cue, intervals: list[tuple[float, float]]) -> float:
     """Measure voiced time inside a cue, excluding detected pauses."""
     return sum(
@@ -300,10 +363,27 @@ def active_duration(cue: Cue, intervals: list[tuple[float, float]]) -> float:
     )
 
 
-def translate_cues(cues: list[Cue], source: str, target: str, device: str) -> list[Cue]:
-    """Translate cue text with an OPUS-MT model while retaining exact timestamps."""
+def extract_text_options(cues: list[Cue]) -> tuple[list[Cue], list[list[str]]]:
+    """Allow curated alternatives separated by ` || ` inside a timed cue."""
+    primary: list[Cue] = []
+    options: list[list[str]] = []
+    for cue in cues:
+        alternatives = list(
+            dict.fromkeys(part.strip() for part in cue.text.split(" || ") if part.strip())
+        )
+        if not alternatives:
+            alternatives = [cue.text]
+        primary.append(Cue(cue.start, cue.end, alternatives[0]))
+        options.append(alternatives)
+    return primary, options
+
+
+def translate_cues(
+    cues: list[Cue], source: str, target: str, device: str, variant_count: int = 1
+) -> tuple[list[Cue], list[list[str]]]:
+    """Translate cues and retain alternative wordings for speech selection."""
     if source == target:
-        return cues
+        return cues, [[cue.text] for cue in cues]
     try:
         import torch
         from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
@@ -324,22 +404,41 @@ def translate_cues(cues: list[Cue], source: str, target: str, device: str) -> li
     translation_device = device if device in {"cuda", "mps"} else "cpu"
     translator.to(translation_device)
     result: list[Cue] = []
+    variants: list[list[str]] = []
     for number, cue in enumerate(cues, start=1):
         print(f"Translating cue {number}/{len(cues)}...", file=sys.stderr)
         tokens = tokenizer(cue.text, return_tensors="pt", truncation=True).to(translation_device)
+        beam_pool = max(variant_count * 4, 4)
         with torch.inference_mode():
-            translated_tokens = translator.generate(**tokens, max_new_tokens=256)
-        translated = tokenizer.batch_decode(translated_tokens, skip_special_tokens=True)[0].strip()
-        if not translated:
+            translated_tokens = translator.generate(
+                **tokens,
+                max_new_tokens=256,
+                num_beams=beam_pool,
+                num_return_sequences=beam_pool,
+                early_stopping=True,
+            )
+        decoded = tokenizer.batch_decode(translated_tokens, skip_special_tokens=True)
+        pool = list(dict.fromkeys(text.strip() for text in decoded if text.strip()))
+        if not pool:
             raise RuntimeError(f"translation produced empty text for cue {number}")
-        result.append(Cue(cue.start, cue.end, translated))
+        # Keep the model's best beam, then favor concise alternatives for dubbing.
+        alternatives = [pool[0]]
+        for text in sorted(pool[1:], key=lambda value: (len(value.split()), len(value))):
+            if text not in alternatives:
+                alternatives.append(text)
+            if len(alternatives) == variant_count:
+                break
+        for variant_number, text in enumerate(alternatives, start=1):
+            print(f'  variant {variant_number}: "{text}"', file=sys.stderr)
+        result.append(Cue(cue.start, cue.end, alternatives[0]))
+        variants.append(alternatives)
     del translator
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
     elif getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
         torch.mps.empty_cache()
-    return result
+    return result, variants
 
 
 def run(args: argparse.Namespace) -> Path:
@@ -351,12 +450,16 @@ def run(args: argparse.Namespace) -> Path:
         raise ValueError("provide a target language with --language")
     if not 0.0 <= args.exaggeration <= 2.0:
         raise ValueError("--exaggeration must be between 0 and 2")
-    if not 0.0 <= args.cfg_weight <= 1.0:
+    if args.cfg_weight is not None and not 0.0 <= args.cfg_weight <= 1.0:
         raise ValueError("--cfg-weight must be between 0 and 1")
+    if args.accent == "american" and args.language != "en":
+        raise ValueError("--accent american requires --language en")
     if args.temperature <= 0:
         raise ValueError("--temperature must be greater than 0")
     if args.candidates < 1:
         raise ValueError("--candidates must be at least 1")
+    if args.translation_variants < 1:
+        raise ValueError("--translation-variants must be at least 1")
     if args.timing_search < 0:
         raise ValueError("--timing-search cannot be negative")
     if not 0 <= args.duration_tolerance < 1:
@@ -374,16 +477,27 @@ def run(args: argparse.Namespace) -> Path:
         raise RuntimeError("dependencies are missing; install the project with: pip install -e .") from error
 
     device = choose_device(torch, args.device)
+    cfg_weight = args.cfg_weight
+    if cfg_weight is None:
+        cfg_weight = 0.0 if args.accent == "american" else 0.5
     if args.seed is not None:
         torch.manual_seed(args.seed)
         if torch.cuda.is_available():
             torch.cuda.manual_seed_all(args.seed)
 
+    cues, cue_text_options = extract_text_options(cues)
     if args.source_language:
-        cues = translate_cues(cues, args.source_language, args.language, device)
+        cues, cue_text_options = translate_cues(
+            cues,
+            args.source_language,
+            args.language,
+            device,
+            args.translation_variants,
+        )
 
     captions_output = None
-    if args.source_language:
+    has_curated_variants = any(len(options) > 1 for options in cue_text_options)
+    if args.source_language or has_curated_variants:
         captions_output = args.translated_captions_output
         if captions_output is None:
             output_base = args.output.expanduser().resolve()
@@ -429,6 +543,7 @@ def run(args: argparse.Namespace) -> Path:
 
         reference_embedding = model.conds.t3.speaker_emb.squeeze().detach().cpu().numpy()
         reference_embedding /= np.linalg.norm(reference_embedding) + 1e-8
+        chosen_cues: list[Cue] = []
 
         for number, cue in enumerate(cues, start=1):
             print(
@@ -441,52 +556,78 @@ def run(args: argparse.Namespace) -> Path:
             if original_voice_duration < 0.25:
                 original_voice_duration = cue.end - cue.start
             minimum_duration = original_voice_duration * (1 - args.duration_tolerance)
-            candidates: list[tuple[float, float, object]] = []
+            candidates: list[tuple[float, int, float, object, str]] = []
             shortest = None
-            for candidate_number in range(1, args.candidates + 1):
-                generated = model.generate(
-                    cue.text,
-                    language_id=args.language,
-                    exaggeration=args.exaggeration,
-                    cfg_weight=args.cfg_weight,
-                    temperature=args.temperature,
-                ).squeeze().cpu().numpy()
-                if shortest is None or len(generated) < len(shortest):
-                    shortest = generated
-                if len(generated) <= slot_samples:
-                    generated_duration = len(generated) / sample_rate
-                    generated_16k = librosa.resample(
-                        generated, orig_sr=sample_rate, target_sr=16000
+            source_chunk_count = sum(
+                end > cue.start and start < cue.end for start, end in intervals
+            )
+            text_options = cue_text_options[number - 1]
+            total_candidates = len(text_options) * args.candidates
+            candidate_number = 0
+            for text_number, candidate_text in enumerate(text_options, start=1):
+                if len(text_options) > 1:
+                    print(
+                        f'  translation {text_number}/{len(text_options)}: "{candidate_text}"',
+                        file=sys.stderr,
                     )
-                    embedding = model.ve.embeds_from_wavs(
-                        [generated_16k], sample_rate=16000
-                    ).mean(axis=0)
-                    embedding /= np.linalg.norm(embedding) + 1e-8
-                    similarity = float(np.dot(reference_embedding, embedding))
-                    duration_error = abs(generated_duration - original_voice_duration) / original_voice_duration
-                    if generated_duration >= minimum_duration:
-                        candidates.append((duration_error, -similarity, generated))
-                        status = f"duration error {duration_error:.1%}, voice score {similarity:.3f}"
-                    else:
-                        status = (
-                            f"too short; source voice is {original_voice_duration:.2f}s, "
-                            f"voice score {similarity:.3f}"
+                for _ in range(args.candidates):
+                    candidate_number += 1
+                    generated = model.generate(
+                        candidate_text,
+                        language_id=args.language,
+                        exaggeration=args.exaggeration,
+                        cfg_weight=cfg_weight,
+                        temperature=args.temperature,
+                    ).squeeze().cpu().numpy()
+                    if shortest is None or len(generated) < len(shortest[0]):
+                        shortest = (generated, candidate_text)
+                    if len(generated) <= slot_samples:
+                        generated_duration = len(generated) / sample_rate
+                        generated_regions = speech_intervals(generated, sample_rate, librosa, np)
+                        pause_mismatch = (
+                            abs(len(generated_regions) - source_chunk_count) if intervals else 0
                         )
-                    print(
-                        f"  candidate {candidate_number}/{args.candidates}: "
-                        f"{generated_duration:.2f}s, {status}",
-                        file=sys.stderr,
-                    )
-                else:
-                    print(
-                        f"  candidate {candidate_number}/{args.candidates}: "
-                        f"{len(generated) / sample_rate:.2f}s (too long)",
-                        file=sys.stderr,
-                    )
+                        generated_16k = librosa.resample(
+                            generated, orig_sr=sample_rate, target_sr=16000
+                        )
+                        embedding = model.ve.embeds_from_wavs(
+                            [generated_16k], sample_rate=16000
+                        ).mean(axis=0)
+                        embedding /= np.linalg.norm(embedding) + 1e-8
+                        similarity = float(np.dot(reference_embedding, embedding))
+                        duration_error = (
+                            abs(generated_duration - original_voice_duration)
+                            / original_voice_duration
+                        )
+                        if generated_duration >= minimum_duration:
+                            candidates.append(
+                                (duration_error, pause_mismatch, -similarity, generated, candidate_text)
+                            )
+                            status = (
+                                f"duration error {duration_error:.1%}, "
+                                f"pause mismatch {pause_mismatch}, voice score {similarity:.3f}"
+                            )
+                        else:
+                            status = (
+                                f"too short; source voice is {original_voice_duration:.2f}s, "
+                                f"voice score {similarity:.3f}"
+                            )
+                        print(
+                            f"  candidate {candidate_number}/{total_candidates}: "
+                            f"{generated_duration:.2f}s, {status}",
+                            file=sys.stderr,
+                        )
+                    else:
+                        print(
+                            f"  candidate {candidate_number}/{total_candidates}: "
+                            f"{len(generated) / sample_rate:.2f}s (too long)",
+                            file=sys.stderr,
+                        )
             if candidates:
-                # Natural timing is primary; voice similarity breaks near ties.
-                _, _, generated = min(
-                    candidates, key=lambda item: (round(item[0], 2), item[1])
+                # Timing leads; matching pause structure and voice break near ties.
+                _, _, _, generated, chosen_text = min(
+                    candidates,
+                    key=lambda item: (round(item[0], 2), item[1], item[2]),
                 )
             else:
                 assert shortest is not None
@@ -496,7 +637,27 @@ def run(args: argparse.Namespace) -> Path:
                         f"of the original {original_voice_duration:.2f}s speech duration; "
                         "revise the translation or generate more candidates"
                     )
-                generated = shortest
+                generated, chosen_text = shortest
+            chosen_cues.append(Cue(cue.start, cue.end, chosen_text))
+            if args.pause_alignment == "source" and intervals and args.fit != "stretch":
+                generated_regions = speech_intervals(
+                    generated, sample_rate, librosa, np
+                )
+                pause_aligned = align_internal_pauses(
+                    generated,
+                    sample_rate,
+                    cue,
+                    intervals,
+                    generated_regions,
+                    np,
+                )
+                if pause_aligned is not None:
+                    print(
+                        f"  aligned {len(generated_regions) - 1} internal pause(s) "
+                        "to the source waveform",
+                        file=sys.stderr,
+                    )
+                    generated = pause_aligned
             should_stretch = args.fit == "stretch"
             if should_stretch and len(generated) != slot_samples:
                 rate = len(generated) / slot_samples
@@ -518,6 +679,9 @@ def run(args: argparse.Namespace) -> Path:
         if peak > 0.99:
             timeline *= 0.99 / peak
         wav = torch.from_numpy(timeline).unsqueeze(0)
+
+        if captions_output is not None:
+            captions_output.write_text(format_sbv(chosen_cues), encoding="utf-8")
 
         if args.audio_output:
             audio_output = args.audio_output.expanduser().resolve()

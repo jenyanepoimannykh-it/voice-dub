@@ -3,8 +3,8 @@ from pathlib import Path
 import unittest
 
 from voice_dub.cli import (
-    Cue, active_duration, build_parser, choose_device, format_sbv, parse_timed_text,
-    refine_cue_timing,
+    Cue, active_duration, align_internal_pauses, build_parser, choose_device,
+    extract_text_options, format_sbv, parse_timed_text, refine_cue_timing,
 )
 
 
@@ -39,6 +39,44 @@ class CliTests(unittest.TestCase):
         self.assertEqual(args.timing, "waveform")
         self.assertEqual(args.duration_tolerance, 0.25)
         self.assertEqual(args.placement, "center")
+        self.assertEqual(args.pause_alignment, "source")
+        self.assertEqual(args.translation_variants, 3)
+        self.assertEqual(args.accent, "auto")
+
+    def test_aligns_generated_chunks_using_source_pause_proportions(self):
+        import numpy as np
+
+        waveform = np.zeros(100, dtype=np.float32)
+        waveform[10:30] = 1.0
+        waveform[40:60] = 2.0
+        aligned = align_internal_pauses(
+            waveform,
+            sample_rate=100,
+            cue=Cue(0.0, 1.0, "Text"),
+            source_intervals=[(0.1, 0.3), (0.7, 0.9)],
+            generated_intervals=[(0.1, 0.3), (0.4, 0.6)],
+            np=np,
+        )
+        self.assertIsNotNone(aligned)
+        nonzero = np.flatnonzero(aligned)
+        self.assertEqual((nonzero[0], nonzero[-1]), (10, 89))
+        self.assertTrue(np.all(aligned[10:30] == 1.0))
+        self.assertTrue(np.all(aligned[70:90] == 2.0))
+
+    def test_extracts_curated_text_options(self):
+        cues, options = extract_text_options([
+            Cue(1.0, 2.0, "Natural wording || Short wording || Natural wording")
+        ])
+        self.assertEqual(cues[0].text, "Natural wording")
+        self.assertEqual(options[0], ["Natural wording", "Short wording"])
+
+    def test_same_language_translation_returns_one_option_per_cue(self):
+        from voice_dub.cli import translate_cues
+
+        original = [Cue(0.0, 1.0, "Hello")]
+        cues, options = translate_cues(original, "en", "en", "cpu", 3)
+        self.assertEqual(cues, original)
+        self.assertEqual(options, [["Hello"]])
 
     def test_parses_srt_style_timed_text(self):
         cues = parse_timed_text(
