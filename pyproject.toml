@@ -19,3 +19,6 @@ voice-dub = "voice_dub.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+voice_dub = ["assets/*.wav", "assets/*.md"]

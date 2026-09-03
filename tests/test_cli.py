@@ -5,9 +5,10 @@ import tempfile
 import unittest
 
 from voice_dub.cli import (
-    Candidate, Cue, active_duration, align_internal_pauses, append_run_log, build_parser,
+    DEFAULT_VOICE_REFERENCE, MASTER_FILTER, Candidate, Cue, active_duration, align_internal_pauses, append_run_log, build_parser,
     choose_candidate, choose_device, choose_text_for_duration,
-    estimated_spoken_duration, phonetic_units, placement_start,
+    add_phrase_pauses, estimated_spoken_duration, estimated_translation_duration,
+    phonetic_units, placement_start,
     clean_pause_noise, extract_text_options, format_sbv, parse_timed_text,
     speech_only_reference,
     refine_cue_timing,
@@ -47,6 +48,14 @@ class CliTests(unittest.TestCase):
         self.assertEqual(args.pause_alignment, "source")
         self.assertEqual(args.translation_variants, 3)
         self.assertEqual(args.accent, "auto")
+        self.assertEqual(args.cfg_weight, 0.55)
+        self.assertEqual(args.temperature, 0.6)
+        self.assertEqual(args.seed, 91)
+        self.assertEqual(DEFAULT_VOICE_REFERENCE.name, "ref-voice-best-window.wav")
+        self.assertIsNone(args.voice_reference)
+        self.assertTrue(DEFAULT_VOICE_REFERENCE.is_file())
+        self.assertIn("adeclick=", MASTER_FILTER)
+        self.assertIn("m=s", MASTER_FILTER)
 
     def test_rejects_removed_multiple_candidate_option(self):
         with self.assertRaises(SystemExit):
@@ -180,6 +189,12 @@ class CliTests(unittest.TestCase):
         target = estimated_spoken_duration(options[1], "en")
         self.assertEqual(choose_text_for_duration(options, target, "en"), options[1])
 
+    def test_translation_duration_is_source_calibrated(self):
+        source = "Это короткая фраза."
+        target = "This is a short phrase."
+        predicted = estimated_translation_duration(target, source, "ru", "en", 4.0)
+        self.assertAlmostEqual(predicted, 4.0, delta=1.0)
+
     def test_placement_matches_source_voice_onset(self):
         start = placement_start(
             Cue(1.0, 4.0, "Text"), generated_samples=200, sample_rate=100,
@@ -203,6 +218,26 @@ class CliTests(unittest.TestCase):
             previous_end=2.3, next_start=4.5, tolerance=0.25,
         )
         self.assertEqual(start, 230)
+
+    def test_adds_capped_silence_at_phrase_boundaries_without_stretching_audio(self):
+        import numpy as np
+
+        waveform = np.ones(1000, dtype=np.float32)
+        widened, inserted = add_phrase_pauses(
+            waveform, "First phrase, second phrase, and third.", 1000, 2.0, np
+        )
+        self.assertEqual(inserted, 0.5)
+        self.assertEqual(len(widened), 1500)
+
+    def test_does_not_add_phrase_pause_for_small_gap(self):
+        import numpy as np
+
+        waveform = np.ones(1000, dtype=np.float32)
+        widened, inserted = add_phrase_pauses(
+            waveform, "First phrase, second phrase.", 1000, 0.2, np
+        )
+        self.assertIs(widened, waveform)
+        self.assertEqual(inserted, 0.0)
 
     def test_appends_machine_readable_run_log(self):
         with tempfile.TemporaryDirectory() as directory:

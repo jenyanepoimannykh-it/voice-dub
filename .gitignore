@@ -23,7 +23,9 @@ dist/
 .vscode/
 
 # Local input/output media and caption artifacts
+results/
 *.wav
+!src/voice_dub/assets/*.wav
 *.mp3
 *.m4a
 *.aac

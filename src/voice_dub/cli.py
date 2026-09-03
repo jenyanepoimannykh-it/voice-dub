@@ -32,6 +32,18 @@ SBV_TIMING_RE = re.compile(
     r"(?P<end>\d{1,2}:\d{2}:\d{2}[,.]\d{1,3})\s*$"
 )
 VIDEO_SUFFIXES = {".mp4", ".mov", ".mkv", ".webm", ".avi", ".m4v"}
+_BUNDLED_VOICE_REFERENCE = (
+    Path(__file__).resolve().parent / "assets" / "brett-condron-american-baritenor.wav"
+)
+# Prefer the user's curated 1.86s-offset reference in the project directory.
+# Keep the bundled sample only as a portability fallback for other checkouts.
+DEFAULT_VOICE_REFERENCE = Path.cwd() / "ref-voice-best-window.wav"
+if not DEFAULT_VOICE_REFERENCE.is_file():
+    DEFAULT_VOICE_REFERENCE = _BUNDLED_VOICE_REFERENCE
+MASTER_FILTER = (
+    "adeclick=w=20:o=75:a=2:t=12:b=2:m=s,"
+    "highpass=f=55,loudnorm=I=-16:TP=-1.5:LRA=9,alimiter=limit=0.95,apad"
+)
 
 
 @dataclass(frozen=True)
@@ -66,7 +78,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--voice-reference", type=Path,
-        help="optional cleaner voice-only recording for cloning; the main input still controls timing",
+        help=(
+            "voice-only recording for cloning; defaults to ref-voice-best-window.wav "
+            "(1.86s offset) while the main input still controls timing"
+        ),
     )
     parser.add_argument(
         "--text-file", type=Path,
@@ -79,11 +94,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--translation-variants", type=int, default=3,
-        help="alternative translations evaluated per cue (default: 3)",
+        help="alternative translations evaluated per cue, from 1 to 10 (default: 3)",
     )
     parser.add_argument(
-        "--output", "-o", type=Path, default=Path("dubbed.wav"),
-        help="output WAV, or a video to retain the input picture (default: dubbed.wav)",
+        "--output", "-o", type=Path, default=Path("results/dubbed.wav"),
+        help="output WAV/video (default: results/dubbed.wav)",
     )
     parser.add_argument(
         "--audio-output", type=Path,
@@ -91,13 +106,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--device", choices=("auto", "cuda", "mps", "cpu"), default="auto")
     parser.add_argument("--exaggeration", type=float, default=0.4, help="emotion strength (default: 0.4)")
-    parser.add_argument("--cfg-weight", type=float, help="voice/pacing guidance (automatic by default)")
-    parser.add_argument("--temperature", type=float, default=0.7, help="generation randomness (default: 0.7)")
+    parser.add_argument("--cfg-weight", type=float, default=0.55, help="voice/pacing guidance (default: 0.55)")
+    parser.add_argument("--temperature", type=float, default=0.6, help="generation randomness (default: 0.6)")
     parser.add_argument(
         "--accent", choices=("auto", "american"), default="auto",
         help="target pronunciation preset; american is available for English",
     )
-    parser.add_argument("--seed", type=int, help="optional reproducible random seed")
+    parser.add_argument("--seed", type=int, default=91, help="reproducible random seed (default: 91)")
     parser.add_argument(
         "--timing", choices=("waveform", "captions"), default="waveform",
         help="refine caption boundaries using source speech activity (default: waveform)",
@@ -273,7 +288,7 @@ def mux_video(video: Path, audio: Path, output: Path) -> None:
             "ffmpeg", "-y", "-v", "error", "-i", str(video), "-i", str(audio),
             "-map", "0:v:0", "-map", "1:a:0", "-c:v", "copy", "-c:a", "aac",
             "-b:a", "192k", "-ar", "48000", "-ac", "2",
-            "-af", "highpass=f=55,loudnorm=I=-16:TP=-1.5:LRA=9,alimiter=limit=0.95,apad",
+            "-af", MASTER_FILTER,
             "-shortest", str(output),
         ],
         "create dubbed video",
@@ -513,6 +528,23 @@ def estimated_spoken_duration(text: str, language: str) -> float:
     return units / rates.get(language, 4.3) + punctuation_pause
 
 
+def estimated_translation_duration(
+    text: str,
+    source_text: str,
+    source_language: str,
+    target_language: str,
+    source_window: float,
+) -> float:
+    """Predict target duration while calibrating to the source cue's density."""
+    source_estimate = estimated_spoken_duration(source_text, source_language)
+    target_estimate = estimated_spoken_duration(text, target_language)
+    if source_estimate <= 0 or source_window <= 0:
+        return target_estimate
+    # Preserve the source cue's actual pacing (including its caption pauses),
+    # while accounting for different phonetic density and language rates.
+    return source_window * target_estimate / source_estimate
+
+
 def choose_text_for_duration(options: list[str], duration: float, language: str) -> str:
     """Preselect the wording whose estimated spoken length best matches the source."""
     return min(options, key=lambda text: abs(estimated_spoken_duration(text, language) - duration))
@@ -568,6 +600,60 @@ def placement_start(
     else:
         base = max(base, earliest)
     return round(base * sample_rate)
+
+
+def add_phrase_pauses(
+    waveform: object,
+    text: str,
+    sample_rate: int,
+    missing_seconds: float,
+    np: object,
+    max_total: float = 0.6,
+    max_each: float = 0.25,
+) -> tuple[object, float]:
+    """Insert restrained silence at punctuation, cutting at nearby quiet samples."""
+    boundaries = [match.end() for match in re.finditer(r"[,;:—–]", text)]
+    if not boundaries or missing_seconds < 0.35 or len(waveform) < sample_rate // 2:
+        return waveform, 0.0
+    total = min(missing_seconds, max_total, max_each * len(boundaries))
+    pause_samples = round(total / len(boundaries) * sample_rate)
+    search = round(0.3 * sample_rate)
+    smooth = max(1, round(0.008 * sample_rate))
+    energy = np.convolve(
+        np.square(waveform, dtype=np.float32),
+        np.ones(smooth, dtype=np.float32) / smooth,
+        mode="same",
+    )
+    cuts: list[int] = []
+    for boundary in boundaries:
+        expected = round(boundary / max(len(text), 1) * len(waveform))
+        left = max(smooth, expected - search)
+        right = min(len(waveform) - smooth, expected + search)
+        if right > left:
+            cut = left + int(np.argmin(energy[left:right]))
+            if not cuts or cut - cuts[-1] > smooth * 2:
+                cuts.append(cut)
+    if not cuts:
+        return waveform, 0.0
+
+    pieces: list[object] = []
+    cursor = 0
+    fade = np.linspace(1.0, 0.0, smooth, dtype=np.float32)
+    silence = np.zeros(pause_samples, dtype=np.float32)
+    for cut in cuts:
+        piece = waveform[cursor:cut].copy()
+        if len(piece) >= smooth:
+            if cursor:
+                piece[:smooth] *= fade[::-1]
+            piece[-smooth:] *= fade
+        pieces.extend((piece, silence))
+        cursor = cut
+    tail = waveform[cursor:].copy()
+    if len(tail) >= smooth:
+        tail[:smooth] *= fade[::-1]
+    pieces.append(tail)
+    inserted = len(cuts) * pause_samples / sample_rate
+    return np.concatenate(pieces).astype(np.float32, copy=False), inserted
 
 
 def extract_text_options(cues: list[Cue]) -> tuple[list[Cue], list[list[str]]]:
@@ -635,13 +721,27 @@ def translate_cues(
         ranked = sorted(
             enumerate(pool),
             key=lambda item: (
-                round(abs(estimated_spoken_duration(item[1], target) - target_duration), 1),
+                round(
+                    abs(
+                        estimated_translation_duration(
+                            item[1], cue.text, source, target, target_duration
+                        )
+                        - target_duration
+                    ),
+                    3,
+                ),
                 item[0],
             ),
         )
         alternatives = [text for _, text in ranked[:variant_count]]
         for variant_number, text in enumerate(alternatives, start=1):
-            print(f'  variant {variant_number}: "{text}"', file=sys.stderr)
+            predicted = estimated_translation_duration(
+                text, cue.text, source, target, target_duration
+            )
+            print(
+                f'  variant {variant_number}: ({predicted:.2f}s predicted) "{text}"',
+                file=sys.stderr,
+            )
         result.append(Cue(cue.start, cue.end, alternatives[0]))
         variants.append(alternatives)
     del translator
@@ -668,8 +768,8 @@ def run(args: argparse.Namespace) -> Path:
         raise ValueError("--accent american requires --language en")
     if args.temperature <= 0:
         raise ValueError("--temperature must be greater than 0")
-    if args.translation_variants < 1:
-        raise ValueError("--translation-variants must be at least 1")
+    if not 1 <= args.translation_variants <= 10:
+        raise ValueError("--translation-variants must be between 1 and 10")
     if args.timing_search < 0:
         raise ValueError("--timing-search cannot be negative")
     if not 0 <= args.duration_tolerance < 1:
@@ -728,13 +828,24 @@ def run(args: argparse.Namespace) -> Path:
 
     print(f"Loading Chatterbox Multilingual V3 on {device}...", file=sys.stderr)
     model = ChatterboxMultilingualTTS.from_pretrained(device=device, t3_model="v3")
-    with tempfile.TemporaryDirectory(prefix="voice-dub-") as directory:
+    work_root = args.output.expanduser().resolve().parent / ".work"
+    work_root.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="voice-dub-", dir=work_root) as directory:
         timing_wav = Path(directory) / "timing.wav"
         extract_reference(args.reference.resolve(), timing_wav)
-        reference_wav = timing_wav
-        if args.voice_reference:
-            reference_wav = Path(directory) / "voice-reference.wav"
-            extract_reference(args.voice_reference.expanduser().resolve(), reference_wav)
+        selected_voice_reference = (
+            args.voice_reference.expanduser().resolve()
+            if args.voice_reference else DEFAULT_VOICE_REFERENCE
+        )
+        if not selected_voice_reference.is_file():
+            raise RuntimeError(
+                f"default voice reference is missing: '{selected_voice_reference}'"
+            )
+        reference_wav = Path(directory) / "voice-reference.wav"
+        extract_reference(selected_voice_reference, reference_wav)
+        if run_metrics is not None:
+            run_metrics["voice_reference_path"] = str(selected_voice_reference)
+            run_metrics["voice_reference_default"] = args.voice_reference is None
         intervals: list[tuple[float, float]] = []
         if args.timing == "waveform":
             source_waveform, source_rate = librosa.load(timing_wav, sr=None, mono=True)
@@ -753,16 +864,10 @@ def run(args: argparse.Namespace) -> Path:
                 captions_output.write_text(format_sbv(cues), encoding="utf-8")
         # Clean every conditioning prompt, including an explicit
         # --voice-reference, before Chatterbox derives the speaker conditionals.
-        if args.voice_reference:
-            reference_waveform, reference_rate = librosa.load(reference_wav, sr=None, mono=True)
-            reference_intervals = speech_intervals(
-                reference_waveform, reference_rate, librosa, np
-            )
-        else:
-            reference_waveform, reference_rate = librosa.load(timing_wav, sr=None, mono=True)
-            reference_intervals = intervals or speech_intervals(
-                reference_waveform, reference_rate, librosa, np
-            )
+        reference_waveform, reference_rate = librosa.load(reference_wav, sr=None, mono=True)
+        reference_intervals = speech_intervals(
+            reference_waveform, reference_rate, librosa, np
+        )
         if reference_intervals:
             reference_audio = speech_only_reference(
                 reference_waveform, reference_rate, reference_intervals, np
@@ -946,6 +1051,24 @@ def run(args: argparse.Namespace) -> Path:
                     generated = pause_aligned
                     generated_regions = speech_intervals(
                         generated, sample_rate, librosa, np
+                    )
+            if args.fit == "natural":
+                generated, inserted_pause = add_phrase_pauses(
+                    generated,
+                    chosen_text,
+                    sample_rate,
+                    original_voice_duration - len(generated) / sample_rate,
+                    np,
+                )
+                if inserted_pause:
+                    generated_regions = speech_intervals(
+                        generated, sample_rate, librosa, np
+                    )
+                    cue_metrics["inserted_phrase_pause_seconds"] = round(inserted_pause, 3)
+                    print(
+                        f"  inserted {inserted_pause:.2f}s of gentle phrase pauses "
+                        "to reduce empty space",
+                        file=sys.stderr,
                     )
             should_stretch = args.fit == "stretch"
             if should_stretch and len(generated) != slot_samples:

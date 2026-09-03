@@ -44,14 +44,20 @@ The app automatically builds a speech-only conditioning prompt from waveform-det
 
 ```bash
 voice-dub source.mp4 \
-  --voice-reference clean-voice.wav \
   --text-file captions.en.sbv \
   --language en \
   --audio-output dubbed.wav \
   --output dubbed.mp4
 ```
 
-By default, automatic translation produces three wordings ranked by estimated phonetic duration against the source window. The closest-length wording is selected before synthesis, and each cue is sent to the speech model exactly once. Waveform analysis refines caption timing, matches safe intra-line pauses, and aligns generated speech onsets to the source. Placement borrows unused gaps before or after cues and shifts later cues when needed, preventing line overlap whenever the surrounding timeline has enough room. Natural speech may run slightly beyond its caption window and is preserved rather than cut; use `--fit stretch` when every take must fit its window. Pause cleanup uses a soft gate to preserve breaths and quiet consonants. Use `--pause-alignment off` to disable pause matching.
+The local `ref-voice-best-window.wav` (the curated `ref-voice.wav` segment starting
+at `1.86s`) is used by default. Pass `--voice-reference PATH` only when you want
+to clone a different voice. Brett is retained only as a portability fallback.
+The saved project defaults are `cfg-weight 0.55`, temperature `0.6`, exaggeration
+`0.4`, and seed `91`; timing uses waveform analysis with source pause alignment
+and natural fitting. Use `--accent american` for the American-English preset.
+
+By default, automatic translation produces three wordings (or up to ten with `--translation-variants 10`) in one model request. They are ranked before synthesis with a source-calibrated phonetic-duration estimate that accounts for syllable density, language rate, punctuation, and the original cue window. Only the closest-length wording is sent to speech synthesis, exactly once per cue. Waveform analysis refines caption timing, matches safe intra-line pauses, and aligns generated speech onsets to the source. Placement borrows unused gaps before or after cues and shifts later cues when needed, preventing line overlap whenever the surrounding timeline has enough room. Natural fitting preserves the generated voice unchanged and adds up to 0.6 seconds of gentle silence at phrase punctuation when a take is conspicuously short. It never stretches or cuts speech. Use `--fit stretch` only when every take must fill its window exactly. Pause cleanup uses a soft gate to preserve breaths and quiet consonants. Video mastering applies conservative impulse de-clicking before loudness normalization and limiting. Use `--pause-alignment off` to disable pause matching.
 
 For editorial control, put curated alternatives in one cue separated by ` || `. The selected wording is written to the output SBV:
 
