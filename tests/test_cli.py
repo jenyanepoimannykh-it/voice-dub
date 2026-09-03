@@ -4,7 +4,8 @@ import unittest
 
 from voice_dub.cli import (
     Cue, active_duration, align_internal_pauses, build_parser, choose_device,
-    extract_text_options, format_sbv, parse_timed_text, refine_cue_timing,
+    clean_pause_noise, extract_text_options, format_sbv, parse_timed_text,
+    refine_cue_timing,
 )
 
 
@@ -77,6 +78,17 @@ class CliTests(unittest.TestCase):
         cues, options = translate_cues(original, "en", "en", "cpu", 3)
         self.assertEqual(cues, original)
         self.assertEqual(options, [["Hello"]])
+
+    def test_cleans_noise_between_speech_regions(self):
+        import numpy as np
+
+        waveform = np.ones(1000, dtype=np.float32)
+        cleaned = clean_pause_noise(
+            waveform, [(0.1, 0.3), (0.7, 0.9)], sample_rate=1000, np=np, fade_ms=10
+        )
+        self.assertTrue(np.all(cleaned[300:700] == 0.0))
+        self.assertLess(cleaned[100], cleaned[105])
+        self.assertLess(cleaned[295], cleaned[290])
 
     def test_parses_srt_style_timed_text(self):
         cues = parse_timed_text(

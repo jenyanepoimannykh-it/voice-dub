@@ -361,6 +361,32 @@ def align_internal_pauses(
     return aligned
 
 
+def clean_pause_noise(
+    waveform: object,
+    intervals: list[tuple[float, float]],
+    sample_rate: int,
+    np: object,
+    fade_ms: float = 12.0,
+) -> object:
+    """Silence non-speech gaps and gently fade speech edges to prevent clicks."""
+    if not intervals:
+        return waveform
+    cleaned = np.zeros_like(waveform)
+    fade_samples = max(1, round(sample_rate * fade_ms / 1000.0))
+    for start, end in intervals:
+        left = max(0, round(start * sample_rate))
+        right = min(len(waveform), round(end * sample_rate))
+        if right <= left:
+            continue
+        cleaned[left:right] = waveform[left:right]
+        fade = min(fade_samples, (right - left) // 2)
+        if fade:
+            ramp = np.linspace(0.0, 1.0, fade, endpoint=True, dtype=np.float32)
+            cleaned[left:left + fade] *= ramp
+            cleaned[right - fade:right] *= ramp[::-1]
+    return cleaned
+
+
 def active_duration(cue: Cue, intervals: list[tuple[float, float]]) -> float:
     """Measure voiced time inside a cue, excluding detected pauses."""
     return sum(
@@ -644,11 +670,12 @@ def run(args: argparse.Namespace) -> Path:
                         "revise the translation or generate more candidates"
                     )
                 generated, chosen_text = shortest
+            generated_regions = speech_intervals(generated, sample_rate, librosa, np)
+            generated = clean_pause_noise(
+                generated, generated_regions, sample_rate, np
+            )
             chosen_cues.append(Cue(cue.start, cue.end, chosen_text))
             if args.pause_alignment == "source" and intervals and args.fit != "stretch":
-                generated_regions = speech_intervals(
-                    generated, sample_rate, librosa, np
-                )
                 pause_aligned = align_internal_pauses(
                     generated,
                     sample_rate,
