@@ -47,12 +47,11 @@ voice-dub source.mp4 \
   --voice-reference clean-voice.wav \
   --text-file captions.en.sbv \
   --language en \
-  --candidates 3 \
   --audio-output dubbed.wav \
   --output dubbed.mp4
 ```
 
-By default, automatic translation evaluates three wordings per line. Waveform analysis refines caption timing, matches safe intra-line pauses, permits speech up to 25% shorter than the source, and centers remaining space. Spoken audio is never stretched or cut unless explicitly requested. Use `--pause-alignment off` to disable pause matching.
+By default, automatic translation produces three wordings ranked by estimated phonetic duration against the source window. The closest-length wording is selected before synthesis, and each cue is sent to the speech model exactly once. Waveform analysis refines caption timing, matches safe intra-line pauses, and aligns generated speech onsets to the source. Placement borrows unused gaps before or after cues and shifts later cues when needed, preventing line overlap whenever the surrounding timeline has enough room. Natural speech may run slightly beyond its caption window and is preserved rather than cut; use `--fit stretch` when every take must fit its window. Pause cleanup uses a soft gate to preserve breaths and quiet consonants. Use `--pause-alignment off` to disable pause matching.
 
 For editorial control, put curated alternatives in one cue separated by ` || `. The selected wording is written to the output SBV:
 
@@ -61,6 +60,8 @@ This setup is exhausting. || Setting everything up takes a lot out of you.
 ```
 
 Run `voice-dub --help` for all controls or `voice-dub --list-languages` for supported languages.
+
+Every generation appends a JSON Lines record to `voice-dub-runs.jsonl` beside the output. Records include settings, device, total and per-candidate generation time, timing error, pause mismatch, voice similarity, overlap risk, selected wording, score, output size, and failure details. Use `--run-log PATH` to choose another history file.
 
 ## Test
 

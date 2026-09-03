@@ -2,12 +2,15 @@ from __future__ import annotations
 
 import argparse
 import gc
+import json
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 import re
 import subprocess
 import sys
 import tempfile
+import time
 from typing import Sequence
 
 
@@ -36,6 +39,17 @@ class Cue:
     start: float
     end: float
     text: str
+
+
+@dataclass(frozen=True)
+class Candidate:
+    duration_error: float
+    pause_mismatch: int
+    similarity: float
+    overrun: float
+    waveform: object
+    text: str
+    cfg_weight: float
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -85,10 +99,6 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--seed", type=int, help="optional reproducible random seed")
     parser.add_argument(
-        "--candidates", type=int, default=1,
-        help="generate this many versions per cue and choose the closest voice match (default: 1)",
-    )
-    parser.add_argument(
         "--timing", choices=("waveform", "captions"), default="waveform",
         help="refine caption boundaries using source speech activity (default: waveform)",
     )
@@ -115,6 +125,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--translated-captions-output", type=Path,
         help="save translated captions as SBV (default: beside output video/audio)",
+    )
+    parser.add_argument(
+        "--run-log", type=Path,
+        help="append run metrics as JSON Lines (default: voice-dub-runs.jsonl beside output)",
     )
     parser.add_argument(
         "--translate-only", action="store_true",
@@ -207,6 +221,42 @@ def run_ffmpeg(command: list[str], purpose: str) -> None:
         raise RuntimeError(f"could not {purpose}: {message}")
 
 
+def append_run_log(
+    args: argparse.Namespace,
+    metrics: dict[str, object],
+    started_at: str,
+    elapsed_seconds: float,
+    status: str,
+    error: str | None = None,
+) -> Path:
+    """Append a durable, machine-readable record for future comparisons."""
+    output = args.output.expanduser().resolve()
+    destination = (
+        args.run_log.expanduser().resolve()
+        if args.run_log else output.parent / "voice-dub-runs.jsonl"
+    )
+    settings = {
+        key: str(value) if isinstance(value, Path) else value
+        for key, value in vars(args).items()
+        if not key.startswith("_")
+    }
+    record = {
+        "started_at": started_at,
+        "status": status,
+        "elapsed_seconds": round(elapsed_seconds, 3),
+        "output": str(output),
+        "output_bytes": output.stat().st_size if status == "success" and output.exists() else None,
+        "settings": settings,
+        **metrics,
+    }
+    if error:
+        record["error"] = error
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    with destination.open("a", encoding="utf-8") as stream:
+        stream.write(json.dumps(record, ensure_ascii=False) + "\n")
+    return destination
+
+
 def extract_reference(source: Path, destination: Path) -> None:
     run_ffmpeg(
         [
@@ -223,7 +273,8 @@ def mux_video(video: Path, audio: Path, output: Path) -> None:
             "ffmpeg", "-y", "-v", "error", "-i", str(video), "-i", str(audio),
             "-map", "0:v:0", "-map", "1:a:0", "-c:v", "copy", "-c:a", "aac",
             "-b:a", "192k", "-ar", "48000", "-ac", "2",
-            "-af", "loudnorm=I=-16:TP=-1.5:LRA=11,apad", "-shortest", str(output),
+            "-af", "highpass=f=55,loudnorm=I=-16:TP=-1.5:LRA=9,alimiter=limit=0.95,apad",
+            "-shortest", str(output),
         ],
         "create dubbed video",
     )
@@ -366,16 +417,19 @@ def clean_pause_noise(
     intervals: list[tuple[float, float]],
     sample_rate: int,
     np: object,
-    fade_ms: float = 12.0,
+    fade_ms: float = 20.0,
+    margin_ms: float = 35.0,
+    floor_gain: float = 0.06,
 ) -> object:
-    """Silence non-speech gaps and gently fade speech edges to prevent clicks."""
+    """Soft-gate pauses while preserving breaths and quiet consonant edges."""
     if not intervals:
         return waveform
-    cleaned = np.zeros_like(waveform)
+    cleaned = waveform * floor_gain
     fade_samples = max(1, round(sample_rate * fade_ms / 1000.0))
+    margin_samples = max(0, round(sample_rate * margin_ms / 1000.0))
     for start, end in intervals:
-        left = max(0, round(start * sample_rate))
-        right = min(len(waveform), round(end * sample_rate))
+        left = max(0, round(start * sample_rate) - margin_samples)
+        right = min(len(waveform), round(end * sample_rate) + margin_samples)
         if right <= left:
             continue
         cleaned[left:right] = waveform[left:right]
@@ -394,7 +448,7 @@ def speech_only_reference(
     np: object,
     max_seconds: float = 10.0,
 ) -> object:
-    """Concatenate voiced regions for a cleaner speaker-conditioning prompt."""
+    """Concatenate voiced regions without leading, trailing, or long quiet gaps."""
     pieces: list[object] = []
     silence = np.zeros(round(0.08 * sample_rate), dtype=np.float32)
     total = 0
@@ -408,12 +462,16 @@ def speech_only_reference(
         if total + len(piece) > limit:
             piece = piece[: max(0, limit - total)]
         if len(piece):
+            if pieces and total < limit:
+                separator = silence[: max(0, limit - total)]
+                pieces.append(separator)
+                total += len(separator)
+                if total >= limit:
+                    break
             pieces.append(piece)
             total += len(piece)
         if total >= limit:
             break
-        pieces.append(silence)
-        total += len(silence)
     if not pieces:
         return waveform
     return np.concatenate(pieces)[:limit].astype(np.float32, copy=False)
@@ -425,6 +483,91 @@ def active_duration(cue: Cue, intervals: list[tuple[float, float]]) -> float:
         max(0.0, min(cue.end, end) - max(cue.start, start))
         for start, end in intervals
     )
+
+
+def phonetic_units(text: str, language: str) -> int:
+    """Estimate pronounceable units for duration-aware wording selection."""
+    if language in {"zh", "ja"}:
+        characters = re.findall(r"[\u3040-\u30ff\u3400-\u9fff]", text)
+        return max(1, len(characters))
+    vowel_sets = {
+        "en": "aeiouy", "ru": "аеёиоуыэюя", "de": "aeiouyäöü",
+        "fr": "aeiouyàâæéèêëîïôœùûü", "es": "aeiouáéíóúü",
+        "it": "aeiouàèéìíîòóùú", "pt": "aeiouáâãàéêíóôõúü",
+    }
+    vowels = vowel_sets.get(language, "aeiouyáéíóúàèìòùäëïöüâêîôû")
+    groups = re.findall(f"[{re.escape(vowels)}]+", text.lower())
+    words_without_vowels = sum(
+        not any(character in vowels for character in word.lower())
+        for word in re.findall(r"[^\W\d_]+", text, re.UNICODE)
+    )
+    return max(1, len(groups) + words_without_vowels)
+
+
+def estimated_spoken_duration(text: str, language: str) -> float:
+    """Estimate natural speech duration, including small inter-word pauses."""
+    rates = {"en": 4.4, "ru": 4.2, "de": 4.1, "fr": 4.5, "es": 4.6, "it": 4.5,
+             "pt": 4.4, "zh": 4.0, "ja": 4.5}
+    units = phonetic_units(text, language)
+    punctuation_pause = 0.12 * len(re.findall(r"[,;:.!?]", text))
+    return units / rates.get(language, 4.3) + punctuation_pause
+
+
+def choose_text_for_duration(options: list[str], duration: float, language: str) -> str:
+    """Preselect the wording whose estimated spoken length best matches the source."""
+    return min(options, key=lambda text: abs(estimated_spoken_duration(text, language) - duration))
+
+
+def candidate_score(candidate: Candidate) -> float:
+    """Balance timing, identity, pauses, and collisions on comparable scales."""
+    return (
+        0.45 * min(candidate.duration_error, 1.5)
+        + 0.35 * min(max(1.0 - candidate.similarity, 0.0) * 4.0, 1.5)
+        + 0.10 * min(candidate.pause_mismatch / 2.0, 1.0)
+        + 0.10 * min(candidate.overrun, 1.0)
+    )
+
+
+def choose_candidate(candidates: list[Candidate], tolerance: float) -> Candidate:
+    """Choose the best balanced take, falling back when none meet timing tolerance."""
+    if not candidates:
+        raise ValueError("cannot choose from an empty candidate list")
+    eligible = [candidate for candidate in candidates if candidate.duration_error <= tolerance]
+    if eligible:
+        pool = eligible
+    else:
+        closest_error = min(candidate.duration_error for candidate in candidates)
+        pool = [candidate for candidate in candidates if candidate.duration_error <= closest_error + 0.02]
+    return min(pool, key=lambda candidate: (candidate_score(candidate), candidate.duration_error))
+
+
+def placement_start(
+    cue: Cue,
+    generated_samples: int,
+    sample_rate: int,
+    source_regions: list[tuple[float, float]],
+    generated_regions: list[tuple[float, float]],
+    previous_end: float,
+    next_start: float | None,
+    tolerance: float,
+) -> int:
+    """Align voiced onsets, borrowing free gaps without overlapping prior audio."""
+    base = cue.start
+    source = [(max(cue.start, a), min(cue.end, b)) for a, b in source_regions if b > cue.start and a < cue.end]
+    if source and generated_regions:
+        base = source[0][0] - generated_regions[0][0]
+    earliest = max(0.0, previous_end)
+    if next_start is not None:
+        latest = next_start - generated_samples / sample_rate
+        if latest >= earliest:
+            base = min(max(base, earliest), latest)
+        else:
+            # There is not enough room before the following nominal cue. Keep
+            # this cue clear of prior speech; the next cue can shift later.
+            base = max(base, earliest)
+    else:
+        base = max(base, earliest)
+    return round(base * sample_rate)
 
 
 def extract_text_options(cues: list[Cue]) -> tuple[list[Cue], list[list[str]]]:
@@ -485,13 +628,18 @@ def translate_cues(
         pool = list(dict.fromkeys(text.strip() for text in decoded if text.strip()))
         if not pool:
             raise RuntimeError(f"translation produced empty text for cue {number}")
-        # Keep the model's best beam, then favor concise alternatives for dubbing.
-        alternatives = [pool[0]]
-        for text in sorted(pool[1:], key=lambda value: (len(value.split()), len(value))):
-            if text not in alternatives:
-                alternatives.append(text)
-            if len(alternatives) == variant_count:
-                break
+        # Beam outputs are already ordered by translation quality. Prefer those
+        # whose estimated pronunciation length fits the original speech window,
+        # using beam rank to break near-ties.
+        target_duration = cue.end - cue.start
+        ranked = sorted(
+            enumerate(pool),
+            key=lambda item: (
+                round(abs(estimated_spoken_duration(item[1], target) - target_duration), 1),
+                item[0],
+            ),
+        )
+        alternatives = [text for _, text in ranked[:variant_count]]
         for variant_number, text in enumerate(alternatives, start=1):
             print(f'  variant {variant_number}: "{text}"', file=sys.stderr)
         result.append(Cue(cue.start, cue.end, alternatives[0]))
@@ -520,8 +668,6 @@ def run(args: argparse.Namespace) -> Path:
         raise ValueError("--accent american requires --language en")
     if args.temperature <= 0:
         raise ValueError("--temperature must be greater than 0")
-    if args.candidates < 1:
-        raise ValueError("--candidates must be at least 1")
     if args.translation_variants < 1:
         raise ValueError("--translation-variants must be at least 1")
     if args.timing_search < 0:
@@ -541,6 +687,10 @@ def run(args: argparse.Namespace) -> Path:
         raise RuntimeError("dependencies are missing; install the project with: pip install -e .") from error
 
     device = choose_device(torch, args.device)
+    run_metrics = getattr(args, "_run_metrics", None)
+    if run_metrics is not None:
+        run_metrics["device"] = device
+        run_metrics["cues"] = []
     cfg_weight = args.cfg_weight
     if cfg_weight is None:
         cfg_weight = 0.0 if args.accent == "american" else 0.5
@@ -601,17 +751,47 @@ def run(args: argparse.Namespace) -> Path:
                     )
             if captions_output is not None:
                 captions_output.write_text(format_sbv(cues), encoding="utf-8")
-            if not args.voice_reference and intervals:
-                reference_audio = speech_only_reference(
-                    source_waveform, source_rate, intervals, np
-                )
-                reference_wav = Path(directory) / "speech-reference.wav"
-                torchaudio.save(
-                    str(reference_wav),
-                    torch.from_numpy(reference_audio).unsqueeze(0),
-                    source_rate,
-                )
-                print("Using speech-only audio for voice conditioning.", file=sys.stderr)
+        # Clean every conditioning prompt, including an explicit
+        # --voice-reference, before Chatterbox derives the speaker conditionals.
+        if args.voice_reference:
+            reference_waveform, reference_rate = librosa.load(reference_wav, sr=None, mono=True)
+            reference_intervals = speech_intervals(
+                reference_waveform, reference_rate, librosa, np
+            )
+        else:
+            reference_waveform, reference_rate = librosa.load(timing_wav, sr=None, mono=True)
+            reference_intervals = intervals or speech_intervals(
+                reference_waveform, reference_rate, librosa, np
+            )
+        if reference_intervals:
+            reference_audio = speech_only_reference(
+                reference_waveform, reference_rate, reference_intervals, np
+            )
+            reference_wav = Path(directory) / "speech-reference.wav"
+            torchaudio.save(
+                str(reference_wav),
+                torch.from_numpy(reference_audio).unsqueeze(0),
+                reference_rate,
+            )
+            original_seconds = len(reference_waveform) / reference_rate
+            cleaned_seconds = len(reference_audio) / reference_rate
+            if run_metrics is not None:
+                run_metrics["voice_reference"] = {
+                    "original_seconds": round(original_seconds, 3),
+                    "cleaned_seconds": round(cleaned_seconds, 3),
+                    "speech_regions": len(reference_intervals),
+                }
+            print(
+                f"Using cleaned speech-only voice reference: {cleaned_seconds:.2f}s "
+                f"from {len(reference_intervals)} region(s); removed leading/trailing "
+                "silence and quiet gaps.",
+                file=sys.stderr,
+            )
+        else:
+            print(
+                "Warning: no clear speech regions found in voice reference; using it unchanged.",
+                file=sys.stderr,
+            )
         model.prepare_conditionals(str(reference_wav), exaggeration=args.exaggeration)
         sample_rate = model.sr
         timeline = np.zeros(round(cues[-1].end * sample_rate), dtype=np.float32)
@@ -619,6 +799,7 @@ def run(args: argparse.Namespace) -> Path:
         reference_embedding = model.conds.t3.speaker_emb.squeeze().detach().cpu().numpy()
         reference_embedding /= np.linalg.norm(reference_embedding) + 1e-8
         chosen_cues: list[Cue] = []
+        previous_audio_end = 0
 
         for number, cue in enumerate(cues, start=1):
             print(
@@ -630,89 +811,118 @@ def run(args: argparse.Namespace) -> Path:
             original_voice_duration = active_duration(cue, intervals) if intervals else cue.end - cue.start
             if original_voice_duration < 0.25:
                 original_voice_duration = cue.end - cue.start
-            minimum_duration = original_voice_duration * (1 - args.duration_tolerance)
-            candidates: list[tuple[float, int, float, object, str]] = []
-            shortest = None
+            candidates: list[Candidate] = []
+            cue_metrics: dict[str, object] = {
+                "number": number,
+                "start": round(cue.start, 3),
+                "end": round(cue.end, 3),
+                "source_voice_duration": round(original_voice_duration, 3),
+                "candidates": [],
+            }
+            if run_metrics is not None:
+                run_metrics["cues"].append(cue_metrics)
             source_chunk_count = sum(
                 end > cue.start and start < cue.end for start, end in intervals
             )
             text_options = cue_text_options[number - 1]
-            total_candidates = len(text_options) * args.candidates
+            if len(text_options) > 1:
+                selected_text = choose_text_for_duration(
+                    text_options, original_voice_duration, args.language
+                )
+                print(
+                    f'  preselected for phonetic length: "{selected_text}"',
+                    file=sys.stderr,
+                )
+                text_options = [selected_text]
+                cue_metrics["preselected_text"] = selected_text
+                cue_metrics["estimated_text_duration"] = round(
+                    estimated_spoken_duration(selected_text, args.language), 3
+                )
+            total_candidates = 1
             candidate_number = 0
-            for text_number, candidate_text in enumerate(text_options, start=1):
-                if len(text_options) > 1:
-                    print(
-                        f'  translation {text_number}/{len(text_options)}: "{candidate_text}"',
-                        file=sys.stderr,
-                    )
-                for _ in range(args.candidates):
+            for _ in range(1):
+                indices = [0]
+                for text_index in indices:
+                    candidate_text = text_options[text_index]
+                    if len(text_options) > 1:
+                        print(
+                            f'  translation {text_index + 1}/{len(text_options)}: "{candidate_text}"',
+                            file=sys.stderr,
+                        )
                     candidate_number += 1
+                    candidate_cfg = cfg_weight
+                    generation_started = time.monotonic()
                     generated = model.generate(
                         candidate_text,
                         language_id=args.language,
                         exaggeration=args.exaggeration,
-                        cfg_weight=cfg_weight,
+                        cfg_weight=candidate_cfg,
                         temperature=args.temperature,
                     ).squeeze().cpu().numpy()
-                    if shortest is None or len(generated) < len(shortest[0]):
-                        shortest = (generated, candidate_text)
-                    if len(generated) <= slot_samples:
-                        generated_duration = len(generated) / sample_rate
-                        generated_regions = speech_intervals(generated, sample_rate, librosa, np)
-                        pause_mismatch = (
-                            abs(len(generated_regions) - source_chunk_count) if intervals else 0
-                        )
-                        generated_16k = librosa.resample(
-                            generated, orig_sr=sample_rate, target_sr=16000
-                        )
-                        embedding = model.ve.embeds_from_wavs(
-                            [generated_16k], sample_rate=16000
-                        ).mean(axis=0)
-                        embedding /= np.linalg.norm(embedding) + 1e-8
-                        similarity = float(np.dot(reference_embedding, embedding))
-                        duration_error = (
-                            abs(generated_duration - original_voice_duration)
-                            / original_voice_duration
-                        )
-                        if generated_duration >= minimum_duration:
-                            candidates.append(
-                                (duration_error, pause_mismatch, -similarity, generated, candidate_text)
-                            )
-                            status = (
-                                f"duration error {duration_error:.1%}, "
-                                f"pause mismatch {pause_mismatch}, voice score {similarity:.3f}"
-                            )
-                        else:
-                            status = (
-                                f"too short; source voice is {original_voice_duration:.2f}s, "
-                                f"voice score {similarity:.3f}"
-                            )
-                        print(
-                            f"  candidate {candidate_number}/{total_candidates}: "
-                            f"{generated_duration:.2f}s, {status}",
-                            file=sys.stderr,
-                        )
-                    else:
-                        print(
-                            f"  candidate {candidate_number}/{total_candidates}: "
-                            f"{len(generated) / sample_rate:.2f}s (too long)",
-                            file=sys.stderr,
-                        )
-            if candidates:
-                # Timing leads; matching pause structure and voice break near ties.
-                _, _, _, generated, chosen_text = min(
-                    candidates,
-                    key=lambda item: (round(item[0], 2), item[1], item[2]),
-                )
-            else:
-                assert shortest is not None
-                if args.fit == "natural":
-                    raise RuntimeError(
-                        f"cue {number} has no natural candidate within {args.duration_tolerance:.0%} "
-                        f"of the original {original_voice_duration:.2f}s speech duration; "
-                        "revise the translation or generate more candidates"
+                    generation_seconds = time.monotonic() - generation_started
+                    generated_duration = len(generated) / sample_rate
+                    generated_regions = speech_intervals(generated, sample_rate, librosa, np)
+                    pause_mismatch = (
+                        abs(len(generated_regions) - source_chunk_count) if intervals else 0
                     )
-                generated, chosen_text = shortest
+                    generated_16k = librosa.resample(
+                        generated, orig_sr=sample_rate, target_sr=16000
+                    )
+                    embedding = model.ve.embeds_from_wavs(
+                        [generated_16k], sample_rate=16000
+                    ).mean(axis=0)
+                    embedding /= np.linalg.norm(embedding) + 1e-8
+                    similarity = float(np.dot(reference_embedding, embedding))
+                    duration_error = (
+                        abs(generated_duration - original_voice_duration)
+                        / original_voice_duration
+                    )
+                    next_start = cues[number].start if number < len(cues) else None
+                    available = (next_start or cue.end) - cue.start
+                    overrun = max(0.0, generated_duration - available) / max(available, 1e-8)
+                    candidate = Candidate(
+                        duration_error, pause_mismatch, similarity, overrun,
+                        generated, candidate_text, candidate_cfg,
+                    )
+                    candidates.append(candidate)
+                    cue_metrics["candidates"].append({
+                        "text": candidate_text,
+                        "duration": round(generated_duration, 3),
+                        "duration_error": round(duration_error, 4),
+                        "pause_mismatch": pause_mismatch,
+                        "voice_similarity": round(similarity, 4),
+                        "overrun": round(overrun, 4),
+                        "cfg_weight": round(candidate_cfg, 3),
+                        "generation_seconds": round(generation_seconds, 3),
+                        "score": round(candidate_score(candidate), 4),
+                    })
+                    status = "within tolerance" if duration_error <= args.duration_tolerance else "fallback"
+                    print(
+                        f"  candidate {candidate_number}/{total_candidates}: "
+                        f"{generated_duration:.2f}s, duration error {duration_error:.1%} "
+                        f"({status}), pause mismatch {pause_mismatch}, voice score {similarity:.3f}, "
+                        f"cfg {candidate_cfg:.2f}",
+                        file=sys.stderr,
+                    )
+            # Timing leads; matching pause structure and voice break near ties. If no
+            # take is within tolerance, retain the closest one instead of failing.
+            chosen = choose_candidate(candidates, args.duration_tolerance)
+            generated, chosen_text = chosen.waveform, chosen.text
+            cue_metrics["selected"] = {
+                "text": chosen.text,
+                "duration_error": round(chosen.duration_error, 4),
+                "pause_mismatch": chosen.pause_mismatch,
+                "voice_similarity": round(chosen.similarity, 4),
+                "overrun": round(chosen.overrun, 4),
+                "cfg_weight": round(chosen.cfg_weight, 3),
+                "score": round(candidate_score(chosen), 4),
+            }
+            if chosen.duration_error > args.duration_tolerance:
+                print(
+                    f"  no candidate within {args.duration_tolerance:.0%}; "
+                    f"using best take ({chosen.duration_error:.1%} duration error)",
+                    file=sys.stderr,
+                )
             generated_regions = speech_intervals(generated, sample_rate, librosa, np)
             generated = clean_pause_noise(
                 generated, generated_regions, sample_rate, np
@@ -734,6 +944,9 @@ def run(args: argparse.Namespace) -> Path:
                         file=sys.stderr,
                     )
                     generated = pause_aligned
+                    generated_regions = speech_intervals(
+                        generated, sample_rate, librosa, np
+                    )
             should_stretch = args.fit == "stretch"
             if should_stretch and len(generated) != slot_samples:
                 rate = len(generated) / slot_samples
@@ -743,18 +956,32 @@ def run(args: argparse.Namespace) -> Path:
                     file=sys.stderr,
                 )
                 generated = librosa.effects.time_stretch(generated, rate=rate)
-            leading_padding = 0
-            if args.placement == "center" and len(generated) < slot_samples:
-                leading_padding = (slot_samples - len(generated)) // 2
-            start_sample = round(cue.start * sample_rate) + leading_padding
-            copy_count = min(slot_samples, len(generated), len(timeline) - start_sample)
+            next_start = cues[number].start if number < len(cues) else None
+            if args.placement == "center":
+                start_sample = placement_start(
+                    cue, len(generated), sample_rate, intervals, generated_regions,
+                    previous_audio_end / sample_rate, next_start, args.duration_tolerance,
+                )
+            else:
+                start_sample = round(cue.start * sample_rate)
+            copy_count = min(slot_samples, len(generated)) if args.fit == "trim" else len(generated)
+            required_samples = start_sample + copy_count
+            if required_samples > len(timeline):
+                timeline = np.pad(timeline, (0, required_samples - len(timeline)))
             copy_end = start_sample + max(0, copy_count)
             timeline[start_sample:copy_end] += generated[:copy_count]
+            previous_audio_end = copy_end
+            cue_metrics["placed_start"] = round(start_sample / sample_rate, 3)
+            cue_metrics["placed_end"] = round(copy_end / sample_rate, 3)
+            cue_metrics["placement_shift"] = round(start_sample / sample_rate - cue.start, 3)
 
         peak = float(np.max(np.abs(timeline))) if timeline.size else 0.0
         if peak > 0.99:
             timeline *= 0.99 / peak
         wav = torch.from_numpy(timeline).unsqueeze(0)
+        if run_metrics is not None:
+            run_metrics["generated_audio_seconds"] = round(len(timeline) / sample_rate, 3)
+            run_metrics["sample_rate"] = sample_rate
 
         if captions_output is not None:
             captions_output.write_text(format_sbv(chosen_cues), encoding="utf-8")
@@ -785,10 +1012,28 @@ def main(argv: Sequence[str] | None = None) -> int:
         for code, name in LANGUAGES.items():
             print(f"{code}\t{name}")
         return 0
+    started_at = datetime.now(timezone.utc).isoformat()
+    started = time.monotonic()
+    args._run_metrics = {}
     try:
         output = run(args)
     except (ValueError, RuntimeError) as error:
+        try:
+            log_path = append_run_log(
+                args, args._run_metrics, started_at, time.monotonic() - started,
+                "failed", str(error),
+            )
+            print(f"Run metrics: {log_path}", file=sys.stderr)
+        except OSError as log_error:
+            print(f"Could not save run metrics: {log_error}", file=sys.stderr)
         parser.error(str(error))
+    try:
+        log_path = append_run_log(
+            args, args._run_metrics, started_at, time.monotonic() - started, "success"
+        )
+        print(f"Run metrics: {log_path}", file=sys.stderr)
+    except OSError as error:
+        print(f"Could not save run metrics: {error}", file=sys.stderr)
     print(f"Saved: {output}")
     return 0
 
