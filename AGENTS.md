@@ -17,7 +17,9 @@
   recalculate placements after the change.
 - A line is regenerated only when the measured result violates these overlap/gap restrictions. Do not
   synthesize extra variants speculatively when the current placement satisfies them.
-- Before permitting overlap, exhaust shorter variants and then allow at most a 5% speed-up as a final
+- Before permitting overlap, exhaust shorter variants and then allow at most a 3% speed-up as a final
   fallback. Overlap is the last resort.
 - Never cut off the final phrase at the video boundary. Shift it earlier when possible; use overlap only
   when no non-overlapping placement or acceptable variant can preserve the ending.
+- Never slow down generated speech or apply time-stretching below 1.0x; slower stretching creates
+  artifacts. Natural-speed short takes must remain natural and may use safe pauses or placement instead.
