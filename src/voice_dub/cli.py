@@ -37,6 +37,10 @@ SBV_TIMING_RE = re.compile(
 VIDEO_SUFFIXES = {".mp4", ".mov", ".mkv", ".webm", ".avi", ".m4v"}
 # Silence longer than this, where the source has speech, reads as a hole.
 GAP_LIMIT = 0.2
+# Room tone sits this far below the *speech* level — not below the programme
+# RMS, which the silences drag down. Around -35 dB is the usual bed level for
+# dialogue: it holds the floor continuous without reading as hiss.
+ROOM_TONE_HEADROOM = 10 ** (-35.0 / 20.0)
 # Typical residual of the text-duration estimate; a predicted win smaller than
 # this is noise, not a reason to spend another generation.
 PREDICTION_MARGIN = 0.15
@@ -226,6 +230,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--placement", choices=("center", "start"), default="center",
         help="place shorter speech within its source window (default: center)",
+    )
+    parser.add_argument(
+        "--room-tone", choices=("source", "off"), default="source",
+        help=(
+            "lay the source recording's own ambience under the dub so gaps do not "
+            "fall to digital silence (default: source)"
+        ),
     )
     parser.add_argument(
         "--pause-alignment", choices=("source", "off"), default="source",
@@ -617,31 +628,50 @@ def clean_pause_noise(
     intervals: list[tuple[float, float]],
     sample_rate: int,
     np: object,
-    fade_ms: float = 20.0,
+    fade_ms: float = 25.0,
     margin_ms: float = 35.0,
-    floor_gain: float = 0.06,
+    floor_gain: float = 0.18,
+    min_pause: float = 0.30,
 ) -> object:
-    """Soft-gate pauses while preserving breaths and quiet consonant edges."""
+    """Soften long pauses only, leaving the flow between words untouched.
+
+    Gating every gap drives the quiet between words to digital silence — the
+    generated gap is already tens of dB down, so another 15 dB removes the room
+    entirely and the phrase reads as a hard edit. Only stretches longer than
+    `min_pause` are attenuated, and only to `floor_gain`, so breaths and word
+    boundaries keep their ambience.
+    """
     if not intervals:
         return waveform
-    cleaned = waveform * floor_gain
+    length = len(waveform)
+    gain = np.ones(length, dtype=np.float32)
+    margin = max(0, round(sample_rate * margin_ms / 1000.0))
     fade_samples = max(1, round(sample_rate * fade_ms / 1000.0))
-    margin_samples = max(0, round(sample_rate * margin_ms / 1000.0))
+    minimum = round(min_pause * sample_rate)
+
+    gaps: list[tuple[int, int]] = []
+    cursor = 0
     for start, end in intervals:
-        left = max(0, round(start * sample_rate) - margin_samples)
-        right = min(len(waveform), round(end * sample_rate) + margin_samples)
-        if right <= left:
+        left = max(0, round(start * sample_rate) - margin)
+        right = min(length, round(end * sample_rate) + margin)
+        if left > cursor:
+            gaps.append((cursor, left))
+        cursor = max(cursor, right)
+    if cursor < length:
+        gaps.append((cursor, length))
+
+    for left, right in gaps:
+        if right - left < minimum:
             continue
-        cleaned[left:right] = waveform[left:right]
         fade = min(fade_samples, (right - left) // 2)
-        if fade:
-            # Outside the region the signal already sits at `floor_gain`, so the
-            # ramp has to start there. Starting from zero steps down first and
-            # clicks at every region edge.
-            ramp = raised_cosine(fade, np, floor_gain, 1.0)
-            cleaned[left:left + fade] *= ramp
-            cleaned[right - fade:right] *= ramp[::-1]
-    return cleaned
+        if fade < 2:
+            gain[left:right] = floor_gain
+            continue
+        ramp = raised_cosine(fade, np, 1.0, floor_gain)
+        gain[left:left + fade] = ramp
+        gain[left + fade:right - fade] = floor_gain
+        gain[right - fade:right] = ramp[::-1]
+    return (waveform * gain).astype(np.float32, copy=False)
 
 
 def trim_to_speech(
@@ -669,6 +699,62 @@ def trim_to_speech(
         for start, end in intervals
     ]
     return waveform[left:right], shifted
+
+
+def room_tone(
+    waveform: object,
+    sample_rate: int,
+    intervals: list[tuple[float, float]],
+    seconds: float,
+    np: object,
+    min_piece: float = 0.25,
+) -> object | None:
+    """Loop the source's own quiet passages into a bed of that length.
+
+    Chatterbox writes near-silence between words, so a dub of separate takes
+    falls to digital silence and back many times a sentence, which reads as a
+    montage of edits. Laying the original recording's ambience underneath keeps
+    the floor continuous and puts the dub in the room the video was shot in.
+    """
+    if seconds <= 0:
+        return None
+    length = len(waveform)
+    pieces: list[object] = []
+    cursor = 0
+    for start, end in intervals:
+        left = max(0, round(start * sample_rate))
+        if left - cursor >= round(min_piece * sample_rate):
+            pieces.append(waveform[cursor:left])
+        cursor = max(cursor, min(length, round(end * sample_rate)))
+    if length - cursor >= round(min_piece * sample_rate):
+        pieces.append(waveform[cursor:length])
+    if not pieces:
+        return None
+    # Quietest first: avoid breaths, off-mic words and page turns.
+    pieces.sort(key=lambda piece: float(np.sqrt(np.mean(np.square(piece)))))
+    fade = max(1, round(sample_rate * 0.05))
+    bed: list[object] = []
+    total = 0
+    needed = round(seconds * sample_rate)
+    index = 0
+    while total < needed:
+        piece = np.array(pieces[index % len(pieces)], dtype=np.float32, copy=True)
+        index += 1
+        span = min(fade, len(piece) // 2)
+        if span >= 2:
+            ramp = raised_cosine(span, np)
+            piece[:span] *= ramp
+            piece[-span:] *= ramp[::-1]
+        bed.append(piece)
+        total += len(piece)
+        if index > 4 * len(pieces) + 8:
+            break
+    if not bed:
+        return None
+    joined = np.concatenate(bed)
+    if len(joined) < needed:
+        joined = np.tile(joined, int(np.ceil(needed / max(len(joined), 1))))
+    return joined[:needed].astype(np.float32, copy=False)
 
 
 def speech_only_reference(
@@ -1100,6 +1186,8 @@ def run(args: argparse.Namespace) -> Path:
             run_metrics["voice_reference_path"] = str(selected_voice_reference)
             run_metrics["voice_reference_default"] = args.voice_reference is None
         intervals: list[tuple[float, float]] = []
+        source_waveform = None
+        source_rate = 0
         if args.timing == "waveform":
             source_waveform, source_rate = librosa.load(timing_wav, sr=None, mono=True)
             intervals = speech_intervals(source_waveform, source_rate, librosa, np)
@@ -1408,6 +1496,39 @@ def run(args: argparse.Namespace) -> Path:
             cue_metrics["placed_start"] = round(start_sample / sample_rate, 3)
             cue_metrics["placed_end"] = round(copy_end / sample_rate, 3)
             cue_metrics["placement_shift"] = round(start_sample / sample_rate - cue.start, 3)
+
+        if args.room_tone == "source" and intervals and source_waveform is not None:
+            # Level of the speech itself: the RMS of every sample would be
+            # dragged down by the pauses the bed is meant to fill.
+            frames = librosa.feature.rms(
+                y=timeline, frame_length=round(sample_rate * 0.02),
+                hop_length=round(sample_rate * 0.01),
+            )[0]
+            speech_rms = float(np.percentile(frames, 80)) if frames.size else 0.0
+            bed = room_tone(
+                source_waveform, source_rate, intervals,
+                len(timeline) / sample_rate, np,
+            )
+            if bed is not None and speech_rms > 0:
+                bed = librosa.resample(bed, orig_sr=source_rate, target_sr=sample_rate)
+                bed = np.resize(bed, len(timeline)).astype(np.float32)
+                bed_rms = float(np.sqrt(np.mean(np.square(bed))))
+                # Keep the bed well under the voice: enough to hold the floor
+                # continuous, never enough to hear as hiss.
+                ceiling = speech_rms * ROOM_TONE_HEADROOM
+                if bed_rms > 0:
+                    bed *= min(1.0, ceiling / bed_rms)
+                    timeline = timeline + bed
+                    level = 20 * np.log10(
+                        float(np.sqrt(np.mean(np.square(bed)))) / speech_rms + 1e-12
+                    )
+                    print(
+                        f"Laid source room tone under the dub at {level:.0f} dB "
+                        "relative to speech.",
+                        file=sys.stderr,
+                    )
+                    if run_metrics is not None:
+                        run_metrics["room_tone_db"] = round(level, 1)
 
         peak = float(np.max(np.abs(timeline))) if timeline.size else 0.0
         if peak > 0.99:

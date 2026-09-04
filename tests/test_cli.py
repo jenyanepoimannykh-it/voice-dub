@@ -12,7 +12,8 @@ from voice_dub.cli import (
     phonetic_units, placement_start,
     clean_pause_noise, extract_text_options, format_sbv, parse_timed_text,
     speech_only_reference, fade_edges, master_filter, LOUDNESS,
-    resample_filter, verify_video_unchanged, raised_cosine,
+    resample_filter, verify_video_unchanged, raised_cosine, room_tone,
+    ROOM_TONE_HEADROOM,
     refine_cue_timing, trim_to_speech,
 )
 
@@ -99,16 +100,29 @@ class CliTests(unittest.TestCase):
         self.assertEqual(cues, original)
         self.assertEqual(options, [["Hello"]])
 
-    def test_cleans_noise_between_speech_regions(self):
+    def test_long_pauses_are_softened_but_short_gaps_are_not(self):
         import numpy as np
 
-        waveform = np.ones(1000, dtype=np.float32)
+        waveform = np.ones(2000, dtype=np.float32)
+        # 0.4 s gap between the regions: long enough to soften.
         cleaned = clean_pause_noise(
-            waveform, [(0.1, 0.3), (0.7, 0.9)], sample_rate=1000, np=np, fade_ms=10
+            waveform, [(0.1, 0.3), (0.7, 0.9)], sample_rate=1000, np=np,
+            fade_ms=25, margin_ms=35, floor_gain=0.18, min_pause=0.30,
         )
-        self.assertTrue(np.allclose(cleaned[335:665], 0.06))
-        self.assertLess(cleaned[65], cleaned[70])
-        self.assertLess(cleaned[330], cleaned[310])
+        self.assertTrue(np.allclose(cleaned[400:600], 0.18))
+        self.assertAlmostEqual(float(cleaned[200]), 1.0, places=5)
+
+    def test_word_gaps_keep_their_ambience(self):
+        import numpy as np
+
+        waveform = np.ones(2000, dtype=np.float32)
+        # 0.1 s between regions: an inter-word gap, must stay untouched.
+        cleaned = clean_pause_noise(
+            waveform, [(0.3, 0.6), (0.7, 1.0)], sample_rate=1000, np=np,
+            fade_ms=25, margin_ms=35, floor_gain=0.18, min_pause=0.30,
+        )
+        self.assertTrue(np.allclose(cleaned[600:700], 1.0))
+
 
     def test_speech_only_reference_removes_long_gaps(self):
         import numpy as np
@@ -345,6 +359,26 @@ class CliTests(unittest.TestCase):
         )
         self.assertGreater(inserted, 0.0)
         self.assertLess(self._max_step(widened), 0.25)
+
+    def test_room_tone_loops_the_quiet_passages_to_length(self):
+        import numpy as np
+
+        rng = np.random.default_rng(0)
+        waveform = (rng.standard_normal(3000) * 0.001).astype(np.float32)
+        waveform[1000:2000] = 0.5  # the speech
+        bed = room_tone(waveform, 1000, [(1.0, 2.0)], seconds=5.0, np=np)
+        self.assertIsNotNone(bed)
+        self.assertEqual(len(bed), 5000)
+        self.assertLess(float(np.max(np.abs(bed))), 0.1)
+
+    def test_room_tone_needs_a_quiet_passage_to_work_from(self):
+        import numpy as np
+
+        waveform = np.ones(1000, dtype=np.float32)
+        self.assertIsNone(room_tone(waveform, 1000, [(0.0, 1.0)], 2.0, np))
+
+    def test_room_tone_sits_far_below_the_voice(self):
+        self.assertLess(ROOM_TONE_HEADROOM, 0.02)
 
     def test_raised_cosine_spans_the_requested_gains(self):
         import numpy as np

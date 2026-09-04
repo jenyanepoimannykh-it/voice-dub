@@ -52,6 +52,31 @@ Likewise, a cue's available room is measured from
 `max(cue.start, previous_audio_end)` — not from `cue.start`. Using `cue.start`
 hides accumulated drift and lets the selector pick variants that cannot fit.
 
+## The "montage" artefact is dead air, not a click
+
+Chatterbox writes near-silence between words. Strung together across cues the
+programme falls to about -70 dBFS and back many times a sentence, and the ear
+reads that as a cut even though there is no discontinuity at all — measured
+sample-to-sample steps at those points are below the 99th percentile of ordinary
+speech slew.
+
+Two things made it worse and one fixes it:
+
+- `clean_pause_noise` gated *every* gap. Gaps under 180 ms were already merged
+  into speech regions by `speech_intervals`, so the audible damage was on real
+  pauses, which it drove from -70 to -93 dBFS. It now softens only stretches
+  longer than 300 ms, and only to -15 dB rather than -24 dB.
+- `room_tone` lays the source recording's own quiet passages under the whole dub
+  at -35 dB relative to the speech level, the usual bed level for dialogue. This
+  is the actual fix: it holds the noise floor continuous and puts the dub in the
+  room the video was shot in. `--room-tone off` disables it.
+
+**How to apply:** measure the gap floor as the 3rd percentile of frame RMS
+against the 80th percentile as the speech level. Under about 40 dB of depth
+reads as continuous; 45 dB and beyond reads as an edit. Take the bed level from
+the *speech* level, never from the programme RMS — the silences drag that down
+and the bed comes out inaudibly quiet.
+
 ## Splices must taper, and the taper must start at the right gain
 
 Two click sources were shipped and had to be fixed:

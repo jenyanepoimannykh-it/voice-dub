@@ -54,6 +54,7 @@ Useful flags:
 | `--voice-reference PATH` | Voice to clone (default: `reference/ref-voice-best-window.wav`) |
 | `--audio-output PATH` | Also save the dub as lossless WAV |
 | `--source-language XX` | Machine-translate the captions first (lower quality than doing it yourself) |
+| `--room-tone off` | Do not lay the source recording's ambience under the dub |
 | `--variant-start first` | Always synthesize the first wording first, instead of the one predicted to fit |
 | `--fit stretch` | Allow 0.96x–1.04x Rubber Band time-stretching |
 | `--run-log PATH` | Where to append per-run metrics (default: beside the output) |
