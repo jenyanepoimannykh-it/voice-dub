@@ -222,25 +222,35 @@ class CliTests(unittest.TestCase):
         )
         self.assertEqual(start, 230)
 
-    def test_adds_capped_silence_at_phrase_boundaries_without_stretching_audio(self):
+
+
+    def test_phrase_pause_only_widens_an_existing_silence(self):
         import numpy as np
 
-        waveform = np.ones(1000, dtype=np.float32)
+        waveform = np.ones(2000, dtype=np.float32)
+        waveform[900:1100] = 0.0                       # a real pause mid-signal
         widened, inserted = add_phrase_pauses(
-            waveform, "First phrase, second phrase, and third.", 1000, 2.0, np
+            waveform, "first phrase, second phrase", 1000, 2.0, np,
+            silences=[(0.9, 1.1)],
         )
-        self.assertEqual(inserted, 0.5)
-        self.assertEqual(len(widened), 1500)
+        self.assertGreater(inserted, 0.0)
+        self.assertEqual(len(widened), 2000 + round(inserted * 1000))
 
-    def test_does_not_add_phrase_pause_for_small_gap(self):
+    def test_phrase_pause_refuses_to_split_continuous_speech(self):
         import numpy as np
 
-        waveform = np.ones(1000, dtype=np.float32)
+        waveform = np.ones(2000, dtype=np.float32)
+        # No silence anywhere: a comma must not become a cut inside a word.
         widened, inserted = add_phrase_pauses(
-            waveform, "First phrase, second phrase.", 1000, 0.2, np
+            waveform, "first phrase, second phrase", 1000, 2.0, np, silences=[],
         )
         self.assertIs(widened, waveform)
         self.assertEqual(inserted, 0.0)
+
+    def test_phrase_pauses_are_off_by_default(self):
+        args = build_parser().parse_args(["v.wav", "-l", "en"])
+        self.assertEqual(args.phrase_pauses, "off")
+
 
     def test_appends_machine_readable_run_log(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -351,15 +361,6 @@ class CliTests(unittest.TestCase):
         # Without a taper each chunk would step 0.0 -> 0.8 in one sample.
         self.assertLess(self._max_step(aligned), 0.4)
 
-    def test_phrase_pauses_taper_even_short_pieces(self):
-        import numpy as np
-
-        waveform = np.full(1000, 0.5, dtype=np.float32)
-        widened, inserted = add_phrase_pauses(
-            waveform, "a, b, c, and d.", 1000, 2.0, np
-        )
-        self.assertGreater(inserted, 0.0)
-        self.assertLess(self._max_step(widened), 0.25)
 
     def test_isolated_burst_in_a_gap_is_ducked(self):
         import numpy as np

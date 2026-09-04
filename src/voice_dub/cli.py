@@ -232,6 +232,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="place shorter speech within its source window (default: center)",
     )
     parser.add_argument(
+        "--phrase-pauses", choices=("on", "off"), default="off",
+        help="widen existing pauses at punctuation to fill spare time (default: off)",
+    )
+    parser.add_argument(
         "--declick", choices=("on", "off"), default="on",
         help="duck isolated impulsive bursts the synthesizer leaves between words (default: on)",
     )
@@ -1001,8 +1005,15 @@ def add_phrase_pauses(
     np: object,
     max_total: float = 0.6,
     max_each: float = 0.25,
+    silences: list[tuple[float, float]] | None = None,
 ) -> tuple[object, float]:
-    """Insert restrained silence at punctuation, cutting at nearby quiet samples."""
+    """Widen pauses the speech already has, at punctuation.
+
+    `silences` are the non-speech stretches of this waveform. Only their
+    midpoints are eligible cut points: mapping a comma to a time by character
+    position is a linear guess that lands inside a word about as often as not,
+    and splicing silence there splits the word in half.
+    """
     boundaries = [match.end() for match in re.finditer(r"[,;:—–]", text)]
     if not boundaries or missing_seconds < 0.35 or len(waveform) < sample_rate // 2:
         return waveform, 0.0
@@ -1019,14 +1030,22 @@ def add_phrase_pauses(
     # Every piece must be long enough to carry a full fade at both ends, so keep
     # cuts clear of the edges and of each other.
     margin = smooth * 2
+    eligible = [
+        round((start + end) / 2 * sample_rate)
+        for start, end in (silences or [])
+        if (end - start) >= 0.06
+    ]
+    if not eligible:
+        return waveform, 0.0
     for boundary in boundaries:
         expected = round(boundary / max(len(text), 1) * len(waveform))
-        left = max(margin, expected - search)
-        right = min(len(waveform) - margin, expected + search)
-        if right > left:
-            cut = left + int(np.argmin(energy[left:right]))
-            if not cuts or cut - cuts[-1] > margin:
-                cuts.append(cut)
+        near = [c for c in eligible
+                if abs(c - expected) <= search and margin <= c <= len(waveform) - margin]
+        if not near:
+            continue
+        cut = min(near, key=lambda c: abs(c - expected))
+        if not cuts or cut - cuts[-1] > margin:
+            cuts.append(cut)
     if not cuts:
         return waveform, 0.0
 
@@ -1542,13 +1561,21 @@ def run(args: argparse.Namespace) -> Path:
                     generated_regions = speech_intervals(
                         generated, sample_rate, librosa, np
                     )
-            if args.fit == "natural":
+            if args.fit == "natural" and args.phrase_pauses == "on":
+                silences = [
+                    (a, b) for a, b in zip(
+                        [0.0] + [end for _, end in generated_regions],
+                        [start for start, _ in generated_regions]
+                        + [len(generated) / sample_rate],
+                    ) if b > a
+                ]
                 generated, inserted_pause = add_phrase_pauses(
                     generated,
                     chosen_text,
                     sample_rate,
                     target - len(generated) / sample_rate,
                     np,
+                    silences=silences,
                 )
                 if inserted_pause:
                     generated_regions = speech_intervals(
