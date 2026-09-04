@@ -573,7 +573,13 @@ def plan_timeline_variants(cues: list[Cue], options: list[list[str]], language: 
             if fitting:
                 selected[i] = max(fitting, key=lambda t: estimated_spoken_duration(t, language))
         elif gap > 0.5:
-            longer = [t for t in options[i] if estimated_spoken_duration(t, language) <= cues[i].end - cues[i].start]
+            # Allow up to one second of estimated overage here: model takes are
+            # often shorter than the phonetic estimate, and a large empty gap
+            # is worse than a near-fitting longer wording.
+            longer = [
+                t for t in options[i]
+                if estimated_spoken_duration(t, language) <= cues[i].end - cues[i].start + 1.0
+            ]
             if longer:
                 selected[i] = max(longer, key=lambda t: estimated_spoken_duration(t, language))
     return selected
