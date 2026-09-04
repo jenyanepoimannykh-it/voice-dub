@@ -1,0 +1,62 @@
+[
+ {
+  "tag": "t323_nr08",
+  "ref_seconds": 10.0,
+  "sim_mean": 0.932,
+  "sim_min": 0.8972,
+  "out_snr": 36.6,
+  "durs": [
+   6.73,
+   2.37,
+   5.44
+  ]
+ },
+ {
+  "tag": "t323_nr14",
+  "ref_seconds": 10.0,
+  "sim_mean": 0.9354,
+  "sim_min": 0.9009,
+  "out_snr": 38.5,
+  "durs": [
+   6.42,
+   2.15,
+   5.8
+  ]
+ },
+ {
+  "tag": "t323_nr20",
+  "ref_seconds": 10.0,
+  "sim_mean": 0.9334,
+  "sim_min": 0.9112,
+  "out_snr": 36.5,
+  "durs": [
+   6.62,
+   2.31,
+   6.15
+  ]
+ },
+ {
+  "tag": "t165_nr14",
+  "ref_seconds": 10.0,
+  "sim_mean": 0.9408,
+  "sim_min": 0.8966,
+  "out_snr": 36.3,
+  "durs": [
+   6.79,
+   2.7,
+   5.63
+  ]
+ },
+ {
+  "tag": "t323_raw",
+  "ref_seconds": 10.0,
+  "sim_mean": 0.9305,
+  "sim_min": 0.9066,
+  "out_snr": 35.5,
+  "durs": [
+   6.42,
+   2.23,
+   5.64
+  ]
+ }
+]

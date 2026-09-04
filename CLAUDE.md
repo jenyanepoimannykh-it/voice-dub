@@ -12,9 +12,9 @@ records context that is not derivable from the code or the git history.
   pipeline is: hand-written target-language SBV with ` || ` variants
   (see [`TRANSLATION_PROMPT.md`](TRANSLATION_PROMPT.md)) passed via
   `--text-file`.
-- The reference voice lives in `reference/ref-voice-best-window.wav`. It is
-  gitignored and must not be committed. The bundled CC0 Brett sample under
-  `src/voice_dub/assets/` is only a portability fallback for clean checkouts.
+- The reference voice lives in `reference/`, which is gitignored and must not
+  be committed. The bundled CC0 Brett sample under `src/voice_dub/assets/` is
+  only a portability fallback for clean checkouts.
 - **The video stream must never be re-encoded.** `mux_video` uses `-c:v copy`;
   verify with matching `ffmpeg -map 0:v:0 -c copy -f md5 -` hashes before and
   after a change that touches muxing.
@@ -61,8 +61,37 @@ hides accumulated drift and lets the selector pick variants that cannot fit.
   are covered by tests but are not on the live path: selection is governed by
   `timing_violation` plus editorial variant order, per `AGENTS.md`.
 
+## Choosing a voice reference
+
+All 153 CC0 voices in [Voice-Zero](https://github.com/OwenTyme/voice-zero) were
+measured (`.work/analyze.py`, `.work/rank.py`) and the shortlist was A/B'd
+through Chatterbox itself. **Raw recording quality does not predict clone
+quality.** `stuart_bell` had the best measured SNR, bandwidth and dryness of any
+male voice and still cloned worst of the shortlist (0.919); `tamurile` had the
+*lowest* source SNR and cloned best (0.937).
+
+**How to apply:** rank candidates by measurement to build a shortlist, then pick
+by synthesizing with each and comparing speaker-embedding similarity — mean and
+minimum across several lines — plus the output's own noise floor. Prefer a
+reference whose *minimum* similarity is high; that is what consistency across
+cues depends on.
+
+Two further findings:
+
+- A denoised prompt yields quieter generated pauses. The Voice-Zero clips are
+  noise-reduced and produced ~12 dB cleaner output than the same speaker's raw
+  LibriVox source; `afftdn` recovered only ~4 dB of that.
+- Longer is not better. A 10s window cut from the original scored no higher than
+  the 7.3s pre-trimmed clip, which won on consistency and cleanliness.
+
+LibriVox is the practical ceiling for CC0 speech: 128 kbps MP3 upstream, no
+lossless, no documented microphones. Claims of specific studio gear cannot be
+verified, so select on measured bandwidth, noise floor and dryness instead.
+
 ## Reference run
 
 `results/shure-cap.en.sbv` dubbing `~/Desktop/shure-vid.mp4` is the worked
-example: 4 cues, 11 takes, every placement within 0.12s of its source cue,
-voice similarity 0.93–0.94, nothing clipped at the video boundary.
+example: 4 cues, 9 takes, every placement within 0.05s of its source cue, voice
+similarity 0.92–0.96, nothing clipped at the video boundary. Source video MD5
+(video stream only) `de2c2ed61cb882d7d36f6b2b2a80ed02` — it must match in the
+output.

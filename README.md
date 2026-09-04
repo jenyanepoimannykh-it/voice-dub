@@ -1,13 +1,21 @@
 # voice-dub
 
-CLI for translating timed captions and dubbing audio or video with [Chatterbox Multilingual V3](https://github.com/resemble-ai/chatterbox). It clones a permitted reference voice, aligns generated speech to real waveform activity, and leaves the video stream unchanged.
+Dubs a video into another language in a cloned voice, and leaves the video
+stream untouched.
+
+You supply the translated subtitles. The tool synthesizes each line, fits it to
+the timing of the original speech, and muxes the result back over the original
+video with `-c:v copy` — the video bitstream is byte-identical.
+
+Built on [Chatterbox Multilingual V3](https://github.com/resemble-ai/chatterbox)
+for zero-shot voice cloning, FFmpeg for I/O and mastering, and librosa for the
+waveform analysis that drives timing.
 
 ## Requirements
 
-- Python 3.10–3.13
-- FFmpeg
-- Apple Silicon, NVIDIA GPU, or CPU
-- Internet access and several GB of disk space for the first model download
+- Python 3.10–3.13, FFmpeg
+- Apple Silicon, an NVIDIA GPU, or CPU
+- Several GB of disk for the model download on first run
 
 ## Install
 
@@ -19,8 +27,6 @@ pip install -e .
 
 ## Use
 
-Dub a video from translated SRT or SBV captions:
-
 ```bash
 voice-dub source.mp4 \
   --text-file captions.en.sbv \
@@ -28,57 +34,68 @@ voice-dub source.mp4 \
   --output dubbed.mp4
 ```
 
-Translate Russian captions to English before dubbing:
-
-```bash
-voice-dub source.mp4 \
-  --text-file captions.ru.sbv \
-  --source-language ru \
-  --language en \
-  --translation-variants 3 \
-  --accent american \
-  --output dubbed.mp4
-```
-
-The app automatically builds a speech-only conditioning prompt from waveform-detected speech. For the closest clone, supply your own clean 6–10 second voice-only recording and retain lossless audio:
-
-```bash
-voice-dub source.mp4 \
-  --text-file captions.en.sbv \
-  --language en \
-  --audio-output dubbed.wav \
-  --output dubbed.mp4
-```
-
-The local, gitignored `reference/ref-voice-best-window.wav` is used by default.
-Pass `--voice-reference PATH` only when you want to clone a different voice. The
-CC0 Brett sample is retained only as a portable fallback for clean checkouts.
-The saved project defaults are `cfg-weight 0.55`, temperature `0.6`, exaggeration
-`0.4`, and seed `91`; timing uses waveform analysis with source pause alignment
-and natural fitting. Use `--accent american` for the American-English preset.
-
-By default, automatic translation produces three wordings (or up to ten with `--translation-variants 10`) in one model request. Curated alternatives may be separated with ` || `. Synthesis always starts with the first editorial variant. If its measured duration creates more than 0.2 seconds of artificial gap or any overlap, the app generates only the next suitable longer or shorter variant and stops retrying as soon as one fits. Overlap is accepted only after the available variant pile is exhausted. Waveform analysis refines caption timing and placement can borrow unused neighboring space. Generated speech is trimmed to its voiced span before measurement, so the synthesizer's padding silence is not mistaken for speech time, and each cue's available room is measured from where the previous line actually ended rather than from its nominal caption start. Natural fitting never time-stretches. Explicit `--fit stretch` uses only the free Rubber Band R3 engine with 32-bit float audio and limits adjustment to 0.96x–1.04x; it fails clearly when Rubber Band is unavailable instead of using a lower-quality fallback. Pause cleanup uses a soft gate, and video mastering applies conservative impulse de-clicking before loudness normalization and limiting.
-
-For editorial control, put curated alternatives in one cue separated by ` || `. The selected wording is written to the output SBV:
+Captions are SBV or SRT. Give each cue up to five wordings separated by ` || `,
+ordered shortest to longest:
 
 ```text
-This setup is exhausting. || Setting everything up takes a lot out of you.
+0:00:00.000,0:00:05.080
+it gets stressful, || it gets pretty stressful, || of course, it gets pretty stressful,
 ```
 
-Duration estimates are calibrated against measured Chatterbox output rather than natural speaking rates, so `estimated_spoken_duration` predicts what the synthesizer will actually produce. Check hand-written variants against it: the five alternatives should bracket the cue window, with the shortest below it and the longest above it.
+The tool synthesizes the first wording, measures it, and only tries another if
+the result overlaps the next line or leaves more than 0.2s of dead air. The
+wording it picks is written to an SBV beside the output.
 
-Run `voice-dub --help` for all controls or `voice-dub --list-languages` for supported languages.
+Useful flags:
 
-For GPT-assisted translation with explicit short, baseline, and long alternatives, use
-[`TRANSLATION_PROMPT.md`](TRANSLATION_PROMPT.md). Separate alternatives with ` || ` so the
-pre-synthesis duration selector can choose one wording without generating multiple takes.
+| Flag | Purpose |
+| --- | --- |
+| `--voice-reference PATH` | Voice to clone (default: `reference/ref-voice-best-window.wav`) |
+| `--audio-output PATH` | Also save the dub as lossless WAV |
+| `--source-language XX` | Machine-translate the captions first (lower quality than doing it yourself) |
+| `--fit stretch` | Allow 0.96x–1.04x Rubber Band time-stretching |
+| `--run-log PATH` | Where to append per-run metrics (default: beside the output) |
 
-Every generation appends a JSON Lines record to `voice-dub-runs.jsonl` beside the output. Records include settings, device, total and per-candidate generation time, timing error, pause mismatch, voice similarity, overlap risk, selected wording, score, output size, and failure details. Use `--run-log PATH` to choose another history file.
+`voice-dub --help` for the rest, `--list-languages` for supported languages.
+
+## Best practices
+
+**Write variants that bracket the cue window.** This matters more than
+anything else. Check them before you run:
+
+```bash
+python -c "
+from voice_dub.cli import estimated_spoken_duration as e
+print(e('your wording here', 'en'))"
+```
+
+The shortest variant should come in under the cue's duration and the longest
+above it. If every variant is shorter than the window, the dub will leave a
+hole there — no amount of tuning fixes that, only more words will.
+
+**Use a clean, dry voice reference.** 7–10 seconds of continuous speech from a
+good microphone, no music, no room echo, no clipping. Bandwidth and noise floor
+matter more than length; a quiet 7-second clip beats a hissy 15-second one.
+
+**Read the run log.** Every run appends JSON Lines with the per-cue placement,
+gap, timing error, and voice similarity. `placement_shift` near zero means the
+dub tracks the original; a large `gap` before a cue points at the previous cue
+being too short.
+
+**Check the video survived**, if you changed anything near muxing:
+
+```bash
+ffmpeg -v error -i in.mp4  -map 0:v:0 -c copy -f md5 -
+ffmpeg -v error -i out.mp4 -map 0:v:0 -c copy -f md5 -
+```
 
 ## Test
 
 ```bash
-PYTHONPATH=src python -m unittest discover -s tests -v
+PYTHONPATH=src python -m unittest discover -s tests
 ```
 
-Only clone voices you own or have permission to use. Chatterbox adds its built-in perceptual watermark to generated audio.
+## Licensing
+
+Only clone voices you own or have permission to use. Chatterbox adds its own
+perceptual watermark to everything it generates.
