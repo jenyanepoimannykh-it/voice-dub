@@ -14,6 +14,8 @@ import time
 import shutil
 from typing import Sequence
 
+from .timing_optimizer import next_variant_index, timing_violation
+
 
 LANGUAGES = {
     "ar": "Arabic", "da": "Danish", "de": "German", "el": "Greek",
@@ -970,34 +972,20 @@ def run(args: argparse.Namespace) -> Path:
             source_chunk_count = sum(
                 end > cue.start and start < cue.end for start, end in intervals
             )
-            # Always synthesize the first editorial variant initially. Timing
-            # fallback decisions belong to timing_optimizer and are made only
-            # after measured durations reveal a violation.
-            text_options = [cue_text_options[number - 1][0]]
-            if len(text_options) > 1:
-                selected_text = choose_text_for_duration(
-                    text_options, original_voice_duration, args.language
-                )
-                print(
-                    f'  preselected for phonetic length: "{selected_text}"',
-                    file=sys.stderr,
-                )
-                text_options = [selected_text]
-                cue_metrics["preselected_text"] = selected_text
-                cue_metrics["estimated_text_duration"] = round(
-                    estimated_spoken_duration(selected_text, args.language), 3
-                )
-            total_candidates = 1
+            text_options = cue_text_options[number - 1]
+            estimates = [estimated_spoken_duration(text, args.language) for text in text_options]
+            next_start = cues[number].start if number < len(cues) else cue.end
+            available = next_start - cue.start
+            tried_indices = [0]
+            candidate_indices: list[int] = []
             candidate_number = 0
-            for _ in range(1):
-                indices = [0]
-                for text_index in indices:
+            while candidate_number < len(tried_indices):
+                    text_index = tried_indices[candidate_number]
                     candidate_text = text_options[text_index]
-                    if len(text_options) > 1:
-                        print(
-                            f'  translation {text_index + 1}/{len(text_options)}: "{candidate_text}"',
-                            file=sys.stderr,
-                        )
+                    print(
+                        f'  variant {text_index + 1}/{len(text_options)}: "{candidate_text}"',
+                        file=sys.stderr,
+                    )
                     candidate_number += 1
                     candidate_cfg = cfg_weight
                     generation_started = time.monotonic()
@@ -1026,14 +1014,13 @@ def run(args: argparse.Namespace) -> Path:
                         abs(generated_duration - original_voice_duration)
                         / original_voice_duration
                     )
-                    next_start = cues[number].start if number < len(cues) else None
-                    available = (next_start or cue.end) - cue.start
                     overrun = max(0.0, generated_duration - available) / max(available, 1e-8)
                     candidate = Candidate(
                         duration_error, pause_mismatch, similarity, overrun,
                         generated, candidate_text, candidate_cfg,
                     )
                     candidates.append(candidate)
+                    candidate_indices.append(text_index)
                     cue_metrics["candidates"].append({
                         "text": candidate_text,
                         "duration": round(generated_duration, 3),
@@ -1047,15 +1034,27 @@ def run(args: argparse.Namespace) -> Path:
                     })
                     status = "within tolerance" if duration_error <= args.duration_tolerance else "fallback"
                     print(
-                        f"  candidate {candidate_number}/{total_candidates}: "
+                        f"  measured take {candidate_number}: "
                         f"{generated_duration:.2f}s, duration error {duration_error:.1%} "
                         f"({status}), pause mismatch {pause_mismatch}, voice score {similarity:.3f}, "
                         f"cfg {candidate_cfg:.2f}",
                         file=sys.stderr,
                     )
-            # Timing leads; matching pause structure and voice break near ties. If no
-            # take is within tolerance, retain the closest one instead of failing.
-            chosen = choose_candidate(candidates, args.duration_tolerance)
+                    retry = next_variant_index(
+                        estimates, tried_indices, generated_duration, available, 0.2
+                    )
+                    if retry is not None:
+                        reason = "gap" if generated_duration < available - 0.2 else "overlap"
+                        print(f"  {reason} violation: retrying with variant {retry + 1}", file=sys.stderr)
+                        tried_indices.append(retry)
+            chosen_position = min(
+                range(len(candidates)),
+                key=lambda i: (
+                    timing_violation(len(candidates[i].waveform) / sample_rate, available, 0.2),
+                    candidate_indices[i],
+                ),
+            )
+            chosen = candidates[chosen_position]
             generated, chosen_text = chosen.waveform, chosen.text
             cue_metrics["selected"] = {
                 "text": chosen.text,

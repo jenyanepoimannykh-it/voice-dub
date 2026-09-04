@@ -1,9 +1,18 @@
 import unittest
 
-from voice_dub.timing_optimizer import choose_variant_indices
+from voice_dub.timing_optimizer import choose_variant_indices, next_variant_index, timing_violation
 
 
 class TimingOptimizerTests(unittest.TestCase):
+    def test_violation_accepts_duration_within_gap_limit(self):
+        self.assertEqual(timing_violation(4.85, 5.0), 0.0)
+
+    def test_next_variant_moves_longer_only_after_measured_gap(self):
+        self.assertEqual(next_variant_index([3.0, 4.7, 5.4], [0], 3.0, 5.0), 1)
+        self.assertIsNone(next_variant_index([3.0, 4.7], [1], 4.85, 5.0))
+
+    def test_next_variant_moves_shorter_after_measured_overlap(self):
+        self.assertEqual(next_variant_index([4.5, 5.5], [1], 5.5, 5.0), 0)
     def test_keeps_first_variants_when_constraints_are_satisfied(self):
         self.assertEqual(
             choose_variant_indices([0, 5], [5, 10], [[4.5, 3.0], [4.0, 3.0]]),

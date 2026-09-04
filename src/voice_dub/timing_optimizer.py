@@ -2,6 +2,29 @@
 from itertools import product
 
 
+def timing_violation(duration: float, available: float, gap_limit: float = 0.2) -> float:
+    """Return seconds outside the allowed [available-gap, available] interval."""
+    if duration > available:
+        return duration - available
+    return max(0.0, available - duration - gap_limit)
+
+
+def next_variant_index(
+    estimates: list[float], tried: list[int], measured_duration: float,
+    available: float, gap_limit: float = 0.2,
+) -> int | None:
+    """Pick an untried variant in the direction needed by measured timing."""
+    if timing_violation(measured_duration, available, gap_limit) == 0:
+        return None
+    want_longer = measured_duration < available - gap_limit
+    current = estimates[tried[-1]]
+    choices = [i for i, estimate in enumerate(estimates) if i not in tried and
+               ((estimate > current) if want_longer else (estimate < current))]
+    if not choices:
+        return None
+    return min(choices, key=lambda i: abs(estimates[i] - available))
+
+
 def choose_variant_indices(
     starts: list[float],
     ends: list[float],
