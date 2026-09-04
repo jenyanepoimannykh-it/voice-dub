@@ -38,8 +38,8 @@ VIDEO_SUFFIXES = {".mp4", ".mov", ".mkv", ".webm", ".avi", ".m4v"}
 _BUNDLED_VOICE_REFERENCE = (
     Path(__file__).resolve().parent / "assets" / "brett-condron-american-baritenor.wav"
 )
-# Prefer the user's curated 1.86s-offset reference in the project directory.
-# Keep the bundled sample only as a portability fallback for other checkouts.
+# Prefer the user's curated project-local reference.
+# Keep the bundled CC0 sample only as a portability fallback for other checkouts.
 DEFAULT_VOICE_REFERENCE = Path.cwd() / "ref-voice-best-window.wav"
 if not DEFAULT_VOICE_REFERENCE.is_file():
     DEFAULT_VOICE_REFERENCE = _BUNDLED_VOICE_REFERENCE
@@ -83,7 +83,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--voice-reference", type=Path,
         help=(
             "voice-only recording for cloning; defaults to ref-voice-best-window.wav "
-            "(1.86s offset) while the main input still controls timing"
+            "when present, while the main input still controls timing"
         ),
     )
     parser.add_argument(
