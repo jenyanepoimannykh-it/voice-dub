@@ -17,8 +17,8 @@
   recalculate placements after the change.
 - A line is regenerated only when the measured result violates these overlap/gap restrictions. Do not
   synthesize extra variants speculatively when the current placement satisfies them.
-- Never time-stretch generated speech. Resolve timing with variants, pauses, and placement; overlap is
-  preferable to introducing stretch artifacts.
+- Natural mode never time-stretches generated speech. Explicit `--fit stretch` may use the fine Rubber
+  Band backend in the conservative 0.96x–1.04x range; outside that range, use variants/placement.
 - Never cut off the final phrase at the video boundary. Shift it earlier when possible; use overlap only
   when no non-overlapping placement or acceptable variant can preserve the ending.
 - Never slow down generated speech or apply time-stretching below 1.0x; slower stretching creates

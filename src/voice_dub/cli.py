@@ -1117,8 +1117,8 @@ def run(args: argparse.Namespace) -> Path:
             should_stretch = args.fit == "stretch"
             # Never time-stretch generated speech: synthetic voices can develop
             # clicks and distortion even with small tempo changes.
-            if args.fit == "stretch" and len(generated) > slot_samples:
-                rate = min(1.03, len(generated) / slot_samples)
+            if args.fit == "stretch" and len(generated) != slot_samples:
+                rate = max(0.96, min(1.04, len(generated) / slot_samples))
                 generated = professional_time_stretch(generated, rate, sample_rate, np)
                 print(f"  Rubber Band fine stretch: {rate:.3f}x", file=sys.stderr)
             next_start = cues[number].start if number < len(cues) else None
