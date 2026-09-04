@@ -52,6 +52,7 @@ class CliTests(unittest.TestCase):
         self.assertEqual(args.temperature, 0.6)
         self.assertEqual(args.seed, 91)
         self.assertEqual(DEFAULT_VOICE_REFERENCE.name, "ref-voice-best-window.wav")
+        self.assertEqual(DEFAULT_VOICE_REFERENCE.parent.name, "reference")
         self.assertIsNone(args.voice_reference)
         self.assertTrue(DEFAULT_VOICE_REFERENCE.is_file())
         self.assertIn("adeclick=", MASTER_FILTER)

@@ -24,6 +24,7 @@ dist/
 
 # Local input/output media and caption artifacts
 results/
+reference/
 *.wav
 !src/voice_dub/assets/*.wav
 *.mp3

@@ -50,9 +50,9 @@ voice-dub source.mp4 \
   --output dubbed.mp4
 ```
 
-The local, gitignored `ref-voice-best-window.wav` is used by default. Pass
-`--voice-reference PATH` only when you want to clone a different voice. The CC0
-Brett sample is retained only as a portable fallback for clean checkouts.
+The local, gitignored `reference/ref-voice-best-window.wav` is used by default.
+Pass `--voice-reference PATH` only when you want to clone a different voice. The
+CC0 Brett sample is retained only as a portable fallback for clean checkouts.
 The saved project defaults are `cfg-weight 0.55`, temperature `0.6`, exaggeration
 `0.4`, and seed `91`; timing uses waveform analysis with source pause alignment
 and natural fitting. Use `--accent american` for the American-English preset.

@@ -40,7 +40,7 @@ _BUNDLED_VOICE_REFERENCE = (
 )
 # Prefer the user's curated project-local reference.
 # Keep the bundled CC0 sample only as a portability fallback for other checkouts.
-DEFAULT_VOICE_REFERENCE = Path.cwd() / "ref-voice-best-window.wav"
+DEFAULT_VOICE_REFERENCE = Path.cwd() / "reference" / "ref-voice-best-window.wav"
 if not DEFAULT_VOICE_REFERENCE.is_file():
     DEFAULT_VOICE_REFERENCE = _BUNDLED_VOICE_REFERENCE
 MASTER_FILTER = (
@@ -82,7 +82,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--voice-reference", type=Path,
         help=(
-            "voice-only recording for cloning; defaults to ref-voice-best-window.wav "
+            "voice-only recording for cloning; defaults to "
+            "reference/ref-voice-best-window.wav "
             "when present, while the main input still controls timing"
         ),
     )
