@@ -1,8 +1,9 @@
 # Project memory
 
-Durable notes for working on this repo. Agent behaviour rules live in
-[`AGENTS.md`](AGENTS.md); this file records context that is not derivable from
-the code or the git history.
+Durable notes for working on this repo. **This file is where project memory
+belongs** — record durable context here rather than in an external per-project
+memory store. Agent behaviour rules live in [`AGENTS.md`](AGENTS.md); this file
+records context that is not derivable from the code or the git history.
 
 ## Owner and workflow
 
