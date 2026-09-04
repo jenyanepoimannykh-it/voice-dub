@@ -22,9 +22,11 @@ dist/
 .idea/
 .vscode/
 
-# Local input/output media and caption artifacts
+# Local input/output media, scratch work, and caption artifacts
 results/
 reference/
+.work/
+*.flac
 *.wav
 !src/voice_dub/assets/*.wav
 *.mp3
