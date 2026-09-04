@@ -678,11 +678,13 @@ def add_phrase_pauses(
 
 
 def professional_time_stretch(waveform: object, rate: float, sample_rate: int, np: object) -> object:
-    """Use Rubber Band for clean speech stretching, with librosa fallback."""
+    """Use the free Rubber Band R3 engine; never fall back to a phase vocoder."""
     rubberband = shutil.which("rubberband")
     if not rubberband:
-        import librosa
-        return librosa.effects.time_stretch(waveform, rate=rate)
+        raise RuntimeError(
+            "--fit stretch requires the free Rubber Band CLI; "
+            "install rubberband or use --fit natural"
+        )
     import soundfile as sf
     work_root = Path.cwd() / ".work"
     work_root.mkdir(parents=True, exist_ok=True)
@@ -1113,9 +1115,7 @@ def run(args: argparse.Namespace) -> Path:
                         "to reduce empty space",
                         file=sys.stderr,
                     )
-            should_stretch = args.fit == "stretch"
-            # Never time-stretch generated speech: synthetic voices can develop
-            # clicks and distortion even with small tempo changes.
+            # Stretching is explicit-only and uses free Rubber Band R3.
             if args.fit == "stretch" and len(generated) != slot_samples:
                 rate = max(0.96, min(1.04, len(generated) / slot_samples))
                 generated = professional_time_stretch(generated, rate, sample_rate, np)
