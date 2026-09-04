@@ -73,9 +73,11 @@ The shortest variant should come in under the cue's duration and the longest
 above it. If every variant is shorter than the window, the dub will leave a
 hole there — no amount of tuning fixes that, only more words will.
 
-**Use a clean, dry voice reference.** 7–10 seconds of continuous speech from a
-good microphone, no music, no room echo, no clipping. Bandwidth and noise floor
-matter more than length; a quiet 7-second clip beats a hissy 15-second one.
+**Pick the voice reference by listening, not by measuring.** 7–10 seconds of
+continuous single-speaker speech, no music, no clipping. Beyond that, render
+full dubs with each candidate and compare them by ear — spectra, noise floor and
+speaker-embedding similarity all rank references confidently and can still land
+on one that sounds wrong.
 
 **Read the run log.** Every run appends JSON Lines with the per-cue placement,
 gap, timing error, and voice similarity. `placement_shift` near zero means the

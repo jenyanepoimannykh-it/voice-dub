@@ -41,7 +41,7 @@ _BUNDLED_VOICE_REFERENCE = (
     Path(__file__).resolve().parent / "assets" / "brett-condron-american-baritenor.wav"
 )
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
-_LOCAL_REFERENCE_NAME = "ref-voice-best-window.wav"
+_LOCAL_REFERENCE_NAMES = ("ref-voice-best-window.wav",)
 
 
 def default_voice_reference() -> Path:
@@ -51,9 +51,10 @@ def default_voice_reference() -> Path:
     project directory or from anywhere else against an installed checkout.
     """
     for root in (Path.cwd(), _PROJECT_ROOT):
-        candidate = root / "reference" / _LOCAL_REFERENCE_NAME
-        if candidate.is_file():
-            return candidate.resolve()
+        for name in _LOCAL_REFERENCE_NAMES:
+            candidate = root / "reference" / name
+            if candidate.is_file():
+                return candidate.resolve()
     return _BUNDLED_VOICE_REFERENCE
 
 

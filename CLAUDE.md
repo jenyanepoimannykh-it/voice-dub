@@ -61,6 +61,23 @@ hides accumulated drift and lets the selector pick variants that cannot fit.
   are covered by tests but are not on the live path: selection is governed by
   `timing_violation` plus editorial variant order, per `AGENTS.md`.
 
+## The voice is settled — and measurements did not pick it
+
+`reference/ref-voice-best-window.wav` is the project voice. The owner compared
+it by ear against the best of 153 CC0 voices and against an original Neumann U47
+recording, and kept their original. It measures worst of the three by a wide
+margin: SNR 21 dB against 44, and 99% of its energy below 4.5 kHz.
+
+**Why it matters:** every objective metric available — bandwidth, noise floor,
+dryness, speaker-embedding similarity — pointed at a voice the owner rejected on
+hearing it. Embedding similarity in particular only measures how closely output
+matches its own prompt; it cannot rank two different voices against each other.
+
+**How to apply:** do not propose swapping the default voice, and do not treat a
+metric win as a reason to. Render candidates as full dubs under distinct names
+and let the owner listen. Keep every rejected candidate in `reference/` with a
+note rather than deleting it.
+
 ## Choosing a voice reference
 
 All 153 CC0 voices in [Voice-Zero](https://github.com/OwenTyme/voice-zero) were
