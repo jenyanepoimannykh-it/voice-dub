@@ -12,7 +12,7 @@
 - Prefer a translation variant whose generated speech fits the cue without creating an artificial gap.
 - If a generated line overlaps the next line, go back to the previous affected cue and try a shorter
   available `||` variant; recalculate placements after the change.
-- If a generated line leaves an artificial gap greater than 0.5 seconds where the original has no
+- If a generated line leaves an artificial gap greater than 0.2 seconds where the original has no
   comparable gap, go back to the previous affected cue and try a longer available `||` variant;
   recalculate placements after the change.
 - A line is regenerated only when the measured result violates these overlap/gap restrictions. Do not

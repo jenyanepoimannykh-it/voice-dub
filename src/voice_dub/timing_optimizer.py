@@ -6,7 +6,7 @@ def choose_variant_indices(
     starts: list[float],
     ends: list[float],
     durations: list[list[float]],
-    gap_limit: float = 0.5,
+    gap_limit: float = 0.2,
 ) -> list[int]:
     """Choose variants with first-choice priority and no avoidable violations.
 
