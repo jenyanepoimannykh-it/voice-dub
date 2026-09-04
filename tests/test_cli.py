@@ -13,6 +13,7 @@ from voice_dub.cli import (
     clean_pause_noise, extract_text_options, format_sbv, parse_timed_text,
     speech_only_reference, fade_edges, master_filter, LOUDNESS,
     resample_filter, verify_video_unchanged, raised_cosine, room_tone,
+    suppress_click_bursts,
     ROOM_TONE_HEADROOM,
     refine_cue_timing, trim_to_speech,
 )
@@ -359,6 +360,39 @@ class CliTests(unittest.TestCase):
         )
         self.assertGreater(inserted, 0.0)
         self.assertLess(self._max_step(widened), 0.25)
+
+    def test_isolated_burst_in_a_gap_is_ducked(self):
+        import numpy as np
+
+        rng = np.random.default_rng(1)
+        sr = 24000
+        y = (rng.standard_normal(sr) * 0.002).astype(np.float32)
+        y[:8000] += (rng.standard_normal(8000) * 0.2).astype(np.float32)   # speech
+        y[16000:24000] += (rng.standard_normal(8000) * 0.2).astype(np.float32)
+        burst = slice(12000, 12120)                                        # 5 ms click
+        y[burst] += (rng.standard_normal(120) * 0.015).astype(np.float32)
+        before = float(np.max(np.abs(y[burst])))
+        out, n = suppress_click_bursts(y, sr, np)
+        self.assertGreaterEqual(n, 1)
+        self.assertLess(float(np.max(np.abs(out[burst]))), before / 3)
+
+    def test_plosive_followed_by_its_vowel_is_kept(self):
+        import numpy as np
+
+        rng = np.random.default_rng(2)
+        sr = 24000
+        y = (rng.standard_normal(sr) * 0.002).astype(np.float32)
+        # Burst immediately followed by loud voiced speech: a consonant, not an
+        # artefact, so it must survive untouched.
+        y[12000:12120] += (rng.standard_normal(120) * 0.015).astype(np.float32)
+        y[12120:20000] += (rng.standard_normal(7880) * 0.2).astype(np.float32)
+        before = float(np.max(np.abs(y[12000:12120])))
+        out, _ = suppress_click_bursts(y, sr, np)
+        self.assertAlmostEqual(float(np.max(np.abs(out[12000:12120]))), before, places=5)
+
+    def test_declick_is_on_by_default(self):
+        args = build_parser().parse_args(["v.wav", "-l", "en"])
+        self.assertEqual(args.declick, "on")
 
     def test_room_tone_loops_the_quiet_passages_to_length(self):
         import numpy as np

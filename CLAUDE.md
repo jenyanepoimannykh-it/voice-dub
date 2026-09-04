@@ -67,10 +67,21 @@ reached it. Chatterbox emits isolated impulsive bursts in the quiet between
 words — a few milliseconds at 5-30x the surrounding floor while speech peaks
 around 0.4 — and no amount of downstream gating or bedding removes them.
 
-Detecting them is delicate: a plosive release is also a short impulsive burst at
-low level, so a plain "loud for its neighbourhood" test flags real consonants
-and ducking those mushes the speech. Confirm any candidate by ear, on an
-isolated clip, before wiring a suppressor into the pipeline.
+`suppress_click_bursts` removes them. Detecting them is delicate: a plosive
+release is also a short impulsive burst at low level, so a plain "loud for its
+neighbourhood" test flags real consonants and ducking those mushes the speech.
+Three constraints make it safe — the burst must be under 20% of the programme
+peak, under 25 ms wide, and quiet on **both** sides for 18 ms. A consonant fails
+the last one, because its vowel follows within a few milliseconds.
+
+Two implementation traps: anchor the burst on its loudest frame and expand
+outward, or one that runs into the following speech looks too wide and is
+skipped; and put the ramps *outside* the burst, or a 5 ms burst with 2 ms ramps
+each side is left almost untouched.
+
+Confirm any candidate by ear on an isolated clip before trusting the detector.
+Ground truth for this project: bursts at 17.231s and 17.587s of the worked
+example.
 
 ## The "montage" artefact is dead air, not a click
 

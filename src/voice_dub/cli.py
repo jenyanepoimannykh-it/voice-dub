@@ -232,6 +232,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="place shorter speech within its source window (default: center)",
     )
     parser.add_argument(
+        "--declick", choices=("on", "off"), default="on",
+        help="duck isolated impulsive bursts the synthesizer leaves between words (default: on)",
+    )
+    parser.add_argument(
         "--room-tone", choices=("source", "off"), default="off",
         help=(
             "lay the source recording's own ambience under the dub so gaps do not "
@@ -621,6 +625,93 @@ def fade_edges(waveform: object, sample_rate: int, np: object,
     faded[:fade] *= ramp
     faded[-fade:] *= ramp[::-1]
     return faded
+
+
+def suppress_click_bursts(
+    waveform: object,
+    sample_rate: int,
+    np: object,
+    ratio: float = 3.5,
+    max_ms: float = 25.0,
+    ceiling: float = 0.20,
+    isolation_ms: float = 18.0,
+    isolation_ratio: float = 1.8,
+    fade_ms: float = 2.0,
+) -> tuple[object, int]:
+    """Duck isolated impulsive bursts sitting alone in quiet passages.
+
+    Chatterbox occasionally emits a few milliseconds of noise between words at
+    many times the surrounding floor, which reads as a click. A plosive release
+    is also short and impulsive, so only bursts with quiet on *both* sides are
+    touched: a real consonant is followed by its vowel within a few
+    milliseconds, an artefact is alone in the gap.
+    """
+    hop = max(1, round(sample_rate * 0.001))
+    frames = len(waveform) // hop
+    if frames < 64:
+        return waveform, 0
+    env = np.abs(waveform[:frames * hop]).reshape(frames, hop).max(axis=1)
+    window = 121
+    padded = np.pad(env, window // 2, mode="edge")
+    background = np.median(
+        np.lib.stride_tricks.sliding_window_view(padded, window), axis=-1
+    )
+    peak = float(np.max(np.abs(waveform)))
+    if peak <= 0:
+        return waveform, 0
+    candidate = (env > np.maximum(background * ratio, 2e-4)) & (env < peak * ceiling)
+
+    half = max(1, int(max_ms / 2))
+    isolation = max(1, int(isolation_ms))
+    gain = np.ones(frames, dtype=np.float32)
+    removed = 0
+    index = 0
+    while index < frames:
+        if not candidate[index]:
+            index += 1
+            continue
+        stop = index
+        while stop < frames and candidate[stop]:
+            stop += 1
+        # Anchor on the loudest frame: a burst that runs into the following
+        # speech would otherwise look too wide and be skipped.
+        centre = index + int(np.argmax(env[index:stop]))
+        level = float(env[centre])
+        edge = max(float(background[centre]) * 1.5, level * 0.25)
+        left = centre
+        while left > 0 and env[left - 1] > edge and centre - left < half:
+            left -= 1
+        right = centre + 1
+        while right < frames and env[right] > edge and right - centre < half:
+            right += 1
+        before = env[max(0, left - isolation):left]
+        after = env[right:right + isolation]
+        if (before.size and after.size
+                and float(before.max()) < level / isolation_ratio
+                and float(after.max()) < level / isolation_ratio):
+            floor = float(np.median(np.concatenate([before, after])))
+            target = min(1.0, floor / max(level, 1e-9))
+            # Ramp outside the burst so its whole width is held at the floor;
+            # ramping within it leaves the peak barely touched.
+            fade = max(1, int(fade_ms))
+            low = max(0, left - fade)
+            high = min(frames, right + fade)
+            curve = np.full(high - low, target, dtype=np.float32)
+            head = left - low
+            tail = high - right
+            if head:
+                curve[:head] = np.linspace(1.0, target, head, dtype=np.float32)
+            if tail:
+                curve[-tail:] = np.linspace(target, 1.0, tail, dtype=np.float32)
+            gain[low:high] = np.minimum(gain[low:high], curve)
+            removed += 1
+        index = stop
+    if not removed:
+        return waveform, 0
+    envelope_gain = np.repeat(gain, hop)
+    full = np.ones(len(waveform), dtype=np.float32)
+    full[:len(envelope_gain)] = envelope_gain
+    return (waveform * full).astype(np.float32, copy=False), removed
 
 
 def clean_pause_noise(
@@ -1422,6 +1513,11 @@ def run(args: argparse.Namespace) -> Path:
                     f"using best take ({chosen.duration_error:.1%} duration error)",
                     file=sys.stderr,
                 )
+            if args.declick == "on":
+                generated, bursts = suppress_click_bursts(generated, sample_rate, np)
+                if bursts:
+                    cue_metrics["declicked_bursts"] = bursts
+                    print(f"  ducked {bursts} click burst(s)", file=sys.stderr)
             generated_regions = list(chosen.regions)
             generated = clean_pause_noise(
                 generated, generated_regions, sample_rate, np
