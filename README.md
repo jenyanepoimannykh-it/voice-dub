@@ -57,13 +57,15 @@ The saved project defaults are `cfg-weight 0.55`, temperature `0.6`, exaggeratio
 `0.4`, and seed `91`; timing uses waveform analysis with source pause alignment
 and natural fitting. Use `--accent american` for the American-English preset.
 
-By default, automatic translation produces three wordings (or up to ten with `--translation-variants 10`) in one model request. Curated alternatives may be separated with ` || `. Synthesis always starts with the first editorial variant. If its measured duration creates more than 0.2 seconds of artificial gap or any overlap, the app generates only the next suitable longer or shorter variant and stops retrying as soon as one fits. Overlap is accepted only after the available variant pile is exhausted. Waveform analysis refines caption timing and placement can borrow unused neighboring space. Natural fitting never time-stretches. Explicit `--fit stretch` uses only the free Rubber Band R3 engine with 32-bit float audio and limits adjustment to 0.96x–1.04x; it fails clearly when Rubber Band is unavailable instead of using a lower-quality fallback. Pause cleanup uses a soft gate, and video mastering applies conservative impulse de-clicking before loudness normalization and limiting.
+By default, automatic translation produces three wordings (or up to ten with `--translation-variants 10`) in one model request. Curated alternatives may be separated with ` || `. Synthesis always starts with the first editorial variant. If its measured duration creates more than 0.2 seconds of artificial gap or any overlap, the app generates only the next suitable longer or shorter variant and stops retrying as soon as one fits. Overlap is accepted only after the available variant pile is exhausted. Waveform analysis refines caption timing and placement can borrow unused neighboring space. Generated speech is trimmed to its voiced span before measurement, so the synthesizer's padding silence is not mistaken for speech time, and each cue's available room is measured from where the previous line actually ended rather than from its nominal caption start. Natural fitting never time-stretches. Explicit `--fit stretch` uses only the free Rubber Band R3 engine with 32-bit float audio and limits adjustment to 0.96x–1.04x; it fails clearly when Rubber Band is unavailable instead of using a lower-quality fallback. Pause cleanup uses a soft gate, and video mastering applies conservative impulse de-clicking before loudness normalization and limiting.
 
 For editorial control, put curated alternatives in one cue separated by ` || `. The selected wording is written to the output SBV:
 
 ```text
 This setup is exhausting. || Setting everything up takes a lot out of you.
 ```
+
+Duration estimates are calibrated against measured Chatterbox output rather than natural speaking rates, so `estimated_spoken_duration` predicts what the synthesizer will actually produce. Check hand-written variants against it: the five alternatives should bracket the cue window, with the shortest below it and the longest above it.
 
 Run `voice-dub --help` for all controls or `voice-dub --list-languages` for supported languages.
 

@@ -1,0 +1,67 @@
+# Project memory
+
+Durable notes for working on this repo. Agent behaviour rules live in
+[`AGENTS.md`](AGENTS.md); this file records context that is not derivable from
+the code or the git history.
+
+## Owner and workflow
+
+- Subtitles are translated **manually** by the owner, not by the built-in
+  OPUS-MT path. `--source-language` exists for convenience but the real
+  pipeline is: hand-written target-language SBV with ` || ` variants
+  (see [`TRANSLATION_PROMPT.md`](TRANSLATION_PROMPT.md)) passed via
+  `--text-file`.
+- The reference voice lives in `reference/ref-voice-best-window.wav`. It is
+  gitignored and must not be committed. The bundled CC0 Brett sample under
+  `src/voice_dub/assets/` is only a portability fallback for clean checkouts.
+- **The video stream must never be re-encoded.** `mux_video` uses `-c:v copy`;
+  verify with matching `ffmpeg -map 0:v:0 -c copy -f md5 -` hashes before and
+  after a change that touches muxing.
+- Push over SSH with `~/.ssh/id_ed25519_jenya_nepoimannykh`
+  (`GIT_SSH_COMMAND='ssh -i ~/.ssh/id_ed25519_jenya_nepoimannykh'`).
+
+## Duration estimation is calibrated to Chatterbox, not to human speech
+
+`estimated_spoken_duration` rates (`en` at 7.7 units/s) look implausibly fast
+for natural speech. They are correct: `phonetic_units` counts **vowel groups**,
+which overcounts syllables ("because" scores 3), and the rates were fitted
+against measured Chatterbox output with its padding trimmed. Nine takes gave
+`duration ≈ 0.130 × units + 0.886s`; the 0.886s constant is the vocoder's
+leading/trailing silence, which `trim_to_speech` now removes, leaving the
+`units / 7.7` slope.
+
+**Why it matters:** the pre-run estimate is what decides whether a hand-written
+variant can fill its cue window. When these constants were set to natural
+speaking rates (4.4 u/s), every hand-written variant came out ~40% too short
+and left large holes in the dub.
+
+**How to apply:** before writing target-language variants, check them with
+`estimated_spoken_duration` so the five alternatives *bracket* the cue window
+(shortest below it, longest above it). If Chatterbox is swapped or retuned,
+re-fit the rates from a run log rather than reasoning about speaking rates.
+
+## Timing fit depends on measuring real speech, not raw output
+
+Chatterbox pads roughly 0.6s of silence around each phrase. Counting that as
+speech time made every cue look longer than it sounded and pushed each
+following cue steadily later. `trim_to_speech` runs before duration is measured
+so variant selection, `available`, and the placement cursor all see real speech.
+
+Likewise, a cue's available room is measured from
+`max(cue.start, previous_audio_end)` — not from `cue.start`. Using `cue.start`
+hides accumulated drift and lets the selector pick variants that cannot fit.
+
+## Known dead ends
+
+- `--accent american` only validates that the language is `en`; the
+  `cfg_weight is None` branch it was meant to trigger is unreachable because
+  `--cfg-weight` defaults to `0.55`. It is effectively a no-op today.
+- `choose_candidate` / `choose_text_for_duration` / `choose_variant_indices`
+  are covered by tests but are not on the live path: selection is governed by
+  `timing_violation` plus editorial variant order, per `AGENTS.md`.
+
+## Reference run
+
+`results/shure-cap.en.sbv` dubbing `~/Desktop/shure-vid.mp4` is the worked
+example: 4 cues, 11 takes, every placement within 0.12s of its source cue,
+voice similarity 0.93–0.94, nothing clipped at the video boundary.

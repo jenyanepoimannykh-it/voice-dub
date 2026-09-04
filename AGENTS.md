@@ -19,5 +19,8 @@
   synthesize extra variants speculatively when the current placement satisfies them.
 - Natural mode never time-stretches generated speech. Explicit `--fit stretch` may use the fine Rubber
   Band backend in the conservative 0.96x–1.04x range; outside that range, use variants/placement.
+- Measure a cue's available room from the later of its caption start and the previous line's
+  real end, so placement drift cannot hide overlap or gap violations.
+- Trim synthesizer padding before measuring a take; padding silence is not speech time.
 - Never cut off the final phrase at the video boundary. Shift it earlier when possible; use overlap only
   when no non-overlapping placement or acceptable variant can preserve the ending.

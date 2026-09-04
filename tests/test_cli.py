@@ -5,13 +5,14 @@ import tempfile
 import unittest
 
 from voice_dub.cli import (
-    DEFAULT_VOICE_REFERENCE, MASTER_FILTER, Candidate, Cue, active_duration, align_internal_pauses, append_run_log, build_parser,
+    DEFAULT_VOICE_REFERENCE, GAP_LIMIT, MASTER_FILTER, Candidate, Cue, active_duration,
+    align_internal_pauses, append_run_log, build_parser, default_voice_reference,
     choose_candidate, choose_device, choose_text_for_duration,
     add_phrase_pauses, estimated_spoken_duration, estimated_translation_duration,
     phonetic_units, placement_start,
     clean_pause_noise, extract_text_options, format_sbv, parse_timed_text,
     speech_only_reference,
-    refine_cue_timing,
+    refine_cue_timing, trim_to_speech,
 )
 
 
@@ -260,6 +261,80 @@ class CliTests(unittest.TestCase):
 
     def test_auto_device_prefers_mps_when_cuda_is_unavailable(self):
         self.assertEqual(choose_device(FakeTorch(), "auto"), "mps")
+
+    def test_voice_reference_resolves_outside_the_project_directory(self):
+        import os
+
+        original = Path.cwd()
+        with tempfile.TemporaryDirectory() as directory:
+            os.chdir(directory)
+            try:
+                resolved = default_voice_reference()
+            finally:
+                os.chdir(original)
+        self.assertEqual(resolved.name, "ref-voice-best-window.wav")
+        self.assertTrue(resolved.is_file())
+
+    def test_placement_uses_trailing_media_time_for_the_final_cue(self):
+        # The generated tail is longer than its cue but fits the video, so it
+        # should stay at the source onset instead of being pulled earlier.
+        start = placement_start(
+            Cue(2.0, 4.0, "Text"), generated_samples=230, sample_rate=100,
+            source_regions=[(2.0, 4.0)], generated_regions=[(0.0, 2.3)],
+            previous_end=1.0, next_start=None, tolerance=0.25, hard_end=4.6,
+        )
+        self.assertEqual(start, 200)
+
+    def test_placement_pulls_the_final_cue_earlier_when_media_is_too_short(self):
+        start = placement_start(
+            Cue(2.0, 4.0, "Text"), generated_samples=300, sample_rate=100,
+            source_regions=[(2.0, 4.0)], generated_regions=[(0.0, 3.0)],
+            previous_end=1.0, next_start=None, tolerance=0.25, hard_end=4.5,
+        )
+        self.assertEqual(start, 150)
+
+    def test_refined_cues_never_overlap_after_a_collapsed_snap(self):
+        cues = [Cue(1.0, 3.0, "One"), Cue(2.9, 3.0, "Two")]
+        refined = refine_cue_timing(cues, [(1.0, 3.0), (2.95, 3.0)], search=0.3)
+        self.assertGreaterEqual(refined[1].start, refined[0].end)
+        self.assertGreater(refined[1].end, refined[1].start)
+
+    def test_curated_variants_split_without_surrounding_spaces(self):
+        cues, options = extract_text_options([Cue(1.0, 2.0, "Long wording||Short")])
+        self.assertEqual(options[0], ["Long wording", "Short"])
+        self.assertEqual(cues[0].text, "Long wording")
+
+    def test_gap_limit_matches_the_documented_tolerance(self):
+        self.assertEqual(GAP_LIMIT, 0.2)
+
+    def test_trims_synthesizer_padding_and_shifts_regions(self):
+        import numpy as np
+
+        waveform = np.zeros(1000, dtype=np.float32)
+        waveform[300:700] = 1.0
+        trimmed, regions = trim_to_speech(
+            waveform, [(0.3, 0.7)], sample_rate=1000, margin_ms=50
+        )
+        self.assertEqual(len(trimmed), 500)
+        self.assertEqual(len(regions), 1)
+        self.assertAlmostEqual(regions[0][0], 0.05)
+        self.assertAlmostEqual(regions[0][1], 0.45)
+
+    def test_trim_keeps_audio_without_detected_speech(self):
+        import numpy as np
+
+        waveform = np.ones(10, dtype=np.float32)
+        trimmed, regions = trim_to_speech(waveform, [], sample_rate=1000)
+        self.assertIs(trimmed, waveform)
+        self.assertEqual(regions, [])
+
+    def test_duration_estimate_matches_measured_synthesis_pace(self):
+        # Measured from a Chatterbox take: 29 vowel groups, two commas, 4.36s
+        # of speech once the vocoder padding is trimmed off.
+        text = ("It's such a complex setup, it really drains all your energy, "
+                "because by the time you set up one")
+        self.assertEqual(phonetic_units(text, "en"), 29)
+        self.assertAlmostEqual(estimated_spoken_duration(text, "en"), 4.36, delta=0.5)
 
 
 if __name__ == "__main__":
