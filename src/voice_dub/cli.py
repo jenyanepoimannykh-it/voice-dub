@@ -687,9 +687,10 @@ def professional_time_stretch(waveform: object, rate: float, sample_rate: int, n
     with tempfile.TemporaryDirectory(prefix="stretch-", dir=work_root) as directory:
         source = Path(directory) / "source.wav"
         target = Path(directory) / "target.wav"
-        sf.write(source, np.asarray(waveform, dtype=np.float32), sample_rate, subtype="PCM_16")
+        # Keep 32-bit float throughout to avoid an extra quantization stage.
+        sf.write(source, np.asarray(waveform, dtype=np.float32), sample_rate, subtype="FLOAT")
         subprocess.run(
-            [rubberband, "--tempo", str(rate), "--crisp", "4", str(source), str(target)],
+            [rubberband, "--fine", "--tempo", str(rate), str(source), str(target)],
             check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
         stretched, _ = sf.read(target, dtype="float32")
