@@ -12,7 +12,7 @@ from voice_dub.cli import (
     phonetic_units, placement_start,
     clean_pause_noise, extract_text_options, format_sbv, parse_timed_text,
     speech_only_reference, fade_edges, master_filter, LOUDNESS,
-    resample_filter, verify_video_unchanged,
+    resample_filter, verify_video_unchanged, raised_cosine,
     refine_cue_timing, trim_to_speech,
 )
 
@@ -300,6 +300,59 @@ class CliTests(unittest.TestCase):
         self.assertNotIn("measured_I", chain)
         self.assertIn("loudnorm=", chain)
         self.assertIn("apad", chain)
+
+    def _max_step(self, waveform):
+        """Largest sample-to-sample jump — a click is a spike in this."""
+        import numpy as np
+
+        return float(np.max(np.abs(np.diff(waveform)))) if len(waveform) > 1 else 0.0
+
+    def test_gate_ramp_starts_at_the_floor_so_edges_do_not_step(self):
+        import numpy as np
+
+        # Continuous tone: any step in the output is the gate's own doing.
+        t = np.arange(4000, dtype=np.float32) / 4000.0
+        waveform = np.sin(2 * np.pi * 220 * t).astype(np.float32)
+        smooth = self._max_step(waveform)
+        cleaned = clean_pause_noise(
+            waveform, [(0.25, 0.75)], sample_rate=4000, np=np,
+            fade_ms=20, margin_ms=0, floor_gain=0.06,
+        )
+        self.assertLess(self._max_step(cleaned), smooth * 3)
+
+    def test_pause_alignment_tapers_chunks_into_silence(self):
+        import numpy as np
+
+        # Two loud blocks that start and end at full amplitude.
+        waveform = np.zeros(4000, dtype=np.float32)
+        waveform[400:1200] = 0.8
+        waveform[1600:2400] = 0.8
+        aligned = align_internal_pauses(
+            waveform, sample_rate=4000, cue=Cue(0.0, 1.0, "Text"),
+            source_intervals=[(0.1, 0.3), (0.7, 0.9)],
+            generated_intervals=[(0.1, 0.3), (0.4, 0.6)], np=np,
+        )
+        self.assertIsNotNone(aligned)
+        # Without a taper each chunk would step 0.0 -> 0.8 in one sample.
+        self.assertLess(self._max_step(aligned), 0.4)
+
+    def test_phrase_pauses_taper_even_short_pieces(self):
+        import numpy as np
+
+        waveform = np.full(1000, 0.5, dtype=np.float32)
+        widened, inserted = add_phrase_pauses(
+            waveform, "a, b, c, and d.", 1000, 2.0, np
+        )
+        self.assertGreater(inserted, 0.0)
+        self.assertLess(self._max_step(widened), 0.25)
+
+    def test_raised_cosine_spans_the_requested_gains(self):
+        import numpy as np
+
+        ramp = raised_cosine(64, np, 0.06, 1.0)
+        self.assertAlmostEqual(float(ramp[0]), 0.06, places=5)
+        self.assertAlmostEqual(float(ramp[-1]), 1.0, places=5)
+        self.assertTrue(np.all(np.diff(ramp) >= 0))
 
     def test_edge_fades_leave_the_interior_untouched(self):
         import numpy as np

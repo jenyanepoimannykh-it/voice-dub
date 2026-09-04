@@ -52,6 +52,33 @@ Likewise, a cue's available room is measured from
 `max(cue.start, previous_audio_end)` — not from `cue.start`. Using `cue.start`
 hides accumulated drift and lets the selector pick variants that cannot fit.
 
+## Splices must taper, and the taper must start at the right gain
+
+Two click sources were shipped and had to be fixed:
+
+- `clean_pause_noise` gates pauses to `floor_gain` (0.06) but ramped its region
+  edges from **0.0**, so every boundary stepped down before ramping up. The step
+  reached ~0.05 — as large as the 99th-percentile slew of real speech, and ~60x
+  the local slew in a quiet passage.
+- `align_internal_pauses` copied speech chunks into a zeroed buffer with no
+  taper at all, stepping 0 -> full amplitude in one sample (~0.9, four times the
+  largest legitimate transient in the programme).
+
+**Why it matters:** both were invisible to every metric being tracked. Timing,
+loudness and similarity were all fine while the audio ticked.
+
+**How to apply:** any time audio is sliced, concatenated, gated or placed, taper
+the join with `raised_cosine`, and start the ramp at the gain the neighbouring
+samples already have — not at zero. `fade_edges` is the helper. Verify by
+measuring the maximum sample-to-sample step in a +/-2 ms window around every
+known splice against the 99th percentile of ordinary speech slew; the splices
+should read 0.00000.
+
+Two dead ends when hunting these: a naive |diff| threshold flags every plosive,
+and a 5-sample median filter at 24 kHz flags every fricative. Neither finds
+clicks in speech. Check the known edit points instead. `adeclick` in the master
+chain does not mask them either — it measurably changes nothing here.
+
 ## Verify the mux, always
 
 A filter FFmpeg cannot configure — `resampler=soxr` on a build without libsoxr,

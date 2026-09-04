@@ -584,9 +584,19 @@ def align_internal_pauses(
     cursor = gap_samples[0]
     for index, chunk in enumerate(generated_chunks):
         end = min(slot_samples, cursor + len(chunk))
-        aligned[cursor:end] = chunk[:end - cursor]
+        # Each chunk lands against silence, so it must fade in and out; copying
+        # it in raw steps from zero to full speech and clicks.
+        piece = fade_edges(chunk[:end - cursor], sample_rate, np, fade_ms=5.0)
+        aligned[cursor:end] = piece
         cursor = end + gap_samples[index + 1]
     return aligned
+
+
+def raised_cosine(length: int, np: object, start: float = 0.0, stop: float = 1.0) -> object:
+    """Half-cosine ramp between two gains, smooth in value and slope."""
+    phase = np.linspace(0.0, np.pi, length, dtype=np.float32)
+    shape = (1.0 - np.cos(phase)) / 2.0
+    return (start + (stop - start) * shape).astype(np.float32)
 
 
 def fade_edges(waveform: object, sample_rate: int, np: object,
@@ -595,7 +605,7 @@ def fade_edges(waveform: object, sample_rate: int, np: object,
     fade = min(max(1, round(sample_rate * fade_ms / 1000.0)), len(waveform) // 2)
     if fade < 2:
         return waveform
-    ramp = np.linspace(0.0, 1.0, fade, dtype=np.float32)
+    ramp = raised_cosine(fade, np)
     faded = np.array(waveform, dtype=np.float32, copy=True)
     faded[:fade] *= ramp
     faded[-fade:] *= ramp[::-1]
@@ -625,7 +635,10 @@ def clean_pause_noise(
         cleaned[left:right] = waveform[left:right]
         fade = min(fade_samples, (right - left) // 2)
         if fade:
-            ramp = np.linspace(0.0, 1.0, fade, endpoint=True, dtype=np.float32)
+            # Outside the region the signal already sits at `floor_gain`, so the
+            # ramp has to start there. Starting from zero steps down first and
+            # clicks at every region edge.
+            ramp = raised_cosine(fade, np, floor_gain, 1.0)
             cleaned[left:left + fade] *= ramp
             cleaned[right - fade:right] *= ramp[::-1]
     return cleaned
@@ -826,33 +839,42 @@ def add_phrase_pauses(
         mode="same",
     )
     cuts: list[int] = []
+    # Every piece must be long enough to carry a full fade at both ends, so keep
+    # cuts clear of the edges and of each other.
+    margin = smooth * 2
     for boundary in boundaries:
         expected = round(boundary / max(len(text), 1) * len(waveform))
-        left = max(smooth, expected - search)
-        right = min(len(waveform) - smooth, expected + search)
+        left = max(margin, expected - search)
+        right = min(len(waveform) - margin, expected + search)
         if right > left:
             cut = left + int(np.argmin(energy[left:right]))
-            if not cuts or cut - cuts[-1] > smooth * 2:
+            if not cuts or cut - cuts[-1] > margin:
                 cuts.append(cut)
     if not cuts:
         return waveform, 0.0
 
     pieces: list[object] = []
     cursor = 0
-    fade = np.linspace(1.0, 0.0, smooth, dtype=np.float32)
     silence = np.zeros(pause_samples, dtype=np.float32)
+
+    def shape(piece: object, fade_in: bool, fade_out: bool) -> object:
+        # Always taper against inserted silence, shrinking the fade for a short
+        # piece rather than skipping it and leaving a step.
+        span = min(smooth, len(piece) // 2)
+        if span < 2:
+            return piece
+        ramp = raised_cosine(span, np)
+        if fade_in:
+            piece[:span] *= ramp
+        if fade_out:
+            piece[-span:] *= ramp[::-1]
+        return piece
+
     for cut in cuts:
-        piece = waveform[cursor:cut].copy()
-        if len(piece) >= smooth:
-            if cursor:
-                piece[:smooth] *= fade[::-1]
-            piece[-smooth:] *= fade
+        piece = shape(waveform[cursor:cut].copy(), bool(cursor), True)
         pieces.extend((piece, silence))
         cursor = cut
-    tail = waveform[cursor:].copy()
-    if len(tail) >= smooth:
-        tail[:smooth] *= fade[::-1]
-    pieces.append(tail)
+    pieces.append(shape(waveform[cursor:].copy(), True, False))
     inserted = len(cuts) * pause_samples / sample_rate
     return np.concatenate(pieces).astype(np.float32, copy=False), inserted
 
@@ -1375,7 +1397,11 @@ def run(args: argparse.Namespace) -> Path:
             if required_samples > len(timeline):
                 timeline = np.pad(timeline, (0, required_samples - len(timeline)))
             copy_end = start_sample + max(0, copy_count)
-            timeline[start_sample:copy_end] += generated[:copy_count]
+            placed = generated[:copy_count]
+            if copy_count < len(generated):
+                # `--fit trim` cuts the tail fade off, so restore one.
+                placed = fade_edges(placed, sample_rate, np)
+            timeline[start_sample:copy_end] += placed
             # An overlapping fallback placement must not rewind the cursor and
             # let the following cue start inside audio that is already written.
             previous_audio_end = max(previous_audio_end, copy_end)
