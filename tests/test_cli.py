@@ -420,6 +420,7 @@ class CliTests(unittest.TestCase):
     def test_variant_start_defaults_to_the_predicted_wording(self):
         args = build_parser().parse_args(["v.wav", "-l", "en"])
         self.assertEqual(args.variant_start, "predicted")
+        self.assertEqual(args.room_tone, "off")
 
     def test_gap_limit_matches_the_documented_tolerance(self):
         self.assertEqual(GAP_LIMIT, 0.2)

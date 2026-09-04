@@ -232,10 +232,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="place shorter speech within its source window (default: center)",
     )
     parser.add_argument(
-        "--room-tone", choices=("source", "off"), default="source",
+        "--room-tone", choices=("source", "off"), default="off",
         help=(
             "lay the source recording's own ambience under the dub so gaps do not "
-            "fall to digital silence (default: source)"
+            "fall to digital silence; audible on a noisy source (default: off)"
         ),
     )
     parser.add_argument(

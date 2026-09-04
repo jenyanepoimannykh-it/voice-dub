@@ -52,6 +52,26 @@ Likewise, a cue's available room is measured from
 `max(cue.start, previous_audio_end)` — not from `cue.start`. Using `cue.start`
 hides accumulated drift and lets the selector pick variants that cannot fit.
 
+## Prove which layer an artefact is in before fixing it
+
+An audible click at one phrase survived three separate fixes — gate ramps,
+splice tapers, a room tone bed — because none of them touched that audio at all.
+Comparing the builds settled it in one command: the affected window was
+**sample-identical** between them (max |diff| 0.000000), so the artefact was in
+the Chatterbox output, reproduced exactly each run because the seed is fixed and
+the take sequence was unchanged.
+
+**How to apply:** when an artefact survives a fix, diff the renders over the
+affected window before theorising again. Identical samples mean the fix never
+reached it. Chatterbox emits isolated impulsive bursts in the quiet between
+words — a few milliseconds at 5-30x the surrounding floor while speech peaks
+around 0.4 — and no amount of downstream gating or bedding removes them.
+
+Detecting them is delicate: a plosive release is also a short impulsive burst at
+low level, so a plain "loud for its neighbourhood" test flags real consonants
+and ducking those mushes the speech. Confirm any candidate by ear, on an
+isolated clip, before wiring a suppressor into the pipeline.
+
 ## The "montage" artefact is dead air, not a click
 
 Chatterbox writes near-silence between words. Strung together across cues the
@@ -66,10 +86,10 @@ Two things made it worse and one fixes it:
   into speech regions by `speech_intervals`, so the audible damage was on real
   pauses, which it drove from -70 to -93 dBFS. It now softens only stretches
   longer than 300 ms, and only to -15 dB rather than -24 dB.
-- `room_tone` lays the source recording's own quiet passages under the whole dub
-  at -35 dB relative to the speech level, the usual bed level for dialogue. This
-  is the actual fix: it holds the noise floor continuous and puts the dub in the
-  room the video was shot in. `--room-tone off` disables it.
+- `room_tone` can lay the source recording's own quiet passages under the dub at
+  -35 dB relative to the speech level. It defaults **off**: on this source the
+  owner found the bed plainly audible, and it did not address the artefact it
+  was written for.
 
 **How to apply:** measure the gap floor as the 3rd percentile of frame RMS
 against the 80th percentile as the speech level. Under about 40 dB of depth
