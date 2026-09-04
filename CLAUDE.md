@@ -52,14 +52,28 @@ Likewise, a cue's available room is measured from
 `max(cue.start, previous_audio_end)` — not from `cue.start`. Using `cue.start`
 hides accumulated drift and lets the selector pick variants that cannot fit.
 
+## Verify the mux, always
+
+A filter FFmpeg cannot configure — `resampler=soxr` on a build without libsoxr,
+for instance — fails the graph and leaves a **zero-byte** container behind while
+the run otherwise looks fine. `verify_video_unchanged` now rejects an empty or
+unreadable output and compares the video stream hash before and after.
+
+**Why it matters:** this was found only because a hash check happened to run.
+Worse, grepping the run's output for `Saved:` and success lines hid the FFmpeg
+error entirely and the run was briefly reported as a success when it had failed.
+
+**How to apply:** never filter a pipeline run's output down to the lines you
+expect to see. Check the exit status and let errors through.
+
 ## Known dead ends
 
 - `--accent american` only validates that the language is `en`; the
   `cfg_weight is None` branch it was meant to trigger is unreachable because
   `--cfg-weight` defaults to `0.55`. It is effectively a no-op today.
-- `choose_candidate` / `choose_text_for_duration` / `choose_variant_indices`
-  are covered by tests but are not on the live path: selection is governed by
-  `timing_violation` plus editorial variant order, per `AGENTS.md`.
+- `choose_candidate`, `choose_text_for_duration` and `choose_variant_indices`
+  were dead code kept alive by their own tests; all three are gone. Selection is
+  `timing_violation` plus editorial order.
 
 ## The voice is settled — and measurements did not pick it
 

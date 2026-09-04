@@ -3,7 +3,7 @@ from __future__ import annotations
 import argparse
 import gc
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 import re
@@ -14,7 +14,7 @@ import time
 import shutil
 from typing import Sequence
 
-from .timing_optimizer import next_variant_index, timing_violation
+from .timing_optimizer import best_start_index, next_variant_index, timing_violation
 
 
 LANGUAGES = {
@@ -37,6 +37,9 @@ SBV_TIMING_RE = re.compile(
 VIDEO_SUFFIXES = {".mp4", ".mov", ".mkv", ".webm", ".avi", ".m4v"}
 # Silence longer than this, where the source has speech, reads as a hole.
 GAP_LIMIT = 0.2
+# Typical residual of the text-duration estimate; a predicted win smaller than
+# this is noise, not a reason to spend another generation.
+PREDICTION_MARGIN = 0.15
 _BUNDLED_VOICE_REFERENCE = (
     Path(__file__).resolve().parent / "assets" / "brett-condron-american-baritenor.wav"
 )
@@ -59,10 +62,84 @@ def default_voice_reference() -> Path:
 
 
 DEFAULT_VOICE_REFERENCE = default_voice_reference()
+LOUDNESS = {"I": -16.0, "TP": -1.5, "LRA": 9.0}
+# Kept as the single-pass fallback; `master_filter()` prefers the measured
+# two-pass form, which hits the target far more accurately.
 MASTER_FILTER = (
     "adeclick=w=20:o=75:a=2:t=12:b=2:m=s,"
     "highpass=f=55,loudnorm=I=-16:TP=-1.5:LRA=9,alimiter=limit=0.95,apad"
 )
+_RESAMPLER: str | None = None
+
+
+def resample_filter() -> str:
+    """28-bit SoX resampling when this FFmpeg has libsoxr, else the built-in.
+
+    `resampler=soxr` is a build option: requesting it on a build without it
+    fails the whole filter graph and writes an empty file, so probe first.
+    """
+    global _RESAMPLER
+    if _RESAMPLER is None:
+        probe = [
+            "ffmpeg", "-v", "error", "-f", "lavfi", "-i", "anullsrc=r=24000:cl=mono",
+            "-t", "0.1", "-af", "aresample=48000:resampler=soxr:precision=28",
+            "-f", "null", "-",
+        ]
+        try:
+            ok = subprocess.run(probe, capture_output=True, check=False).returncode == 0
+        except FileNotFoundError:
+            ok = False
+        _RESAMPLER = (
+            "aresample=48000:resampler=soxr:precision=28:dither_method=triangular"
+            if ok else "aresample=48000:dither_method=triangular"
+        )
+    return _RESAMPLER
+
+
+def measure_loudness(source: Path) -> dict[str, str] | None:
+    """First loudnorm pass: measure the programme so the second pass is exact."""
+    command = [
+        "ffmpeg", "-v", "info", "-nostats", "-i", str(source), "-af",
+        f"loudnorm=I={LOUDNESS['I']}:TP={LOUDNESS['TP']}:LRA={LOUDNESS['LRA']}"
+        ":print_format=json",
+        "-f", "null", "-",
+    ]
+    try:
+        completed = subprocess.run(command, capture_output=True, text=True, check=False)
+    except FileNotFoundError:
+        return None
+    text = completed.stderr
+    start = text.rfind("{")
+    if start < 0:
+        return None
+    try:
+        measured = json.loads(text[start:text.rindex("}") + 1])
+    except (ValueError, json.JSONDecodeError):
+        return None
+    needed = ("input_i", "input_tp", "input_lra", "input_thresh", "target_offset")
+    if not all(key in measured for key in needed):
+        return None
+    return measured
+
+
+def master_filter(measured: dict[str, str] | None) -> str:
+    """Mastering chain: de-click, rumble filter, loudness, limiter, pad."""
+    if measured is None:
+        loudnorm = (
+            f"loudnorm=I={LOUDNESS['I']}:TP={LOUDNESS['TP']}:LRA={LOUDNESS['LRA']}"
+        )
+    else:
+        loudnorm = (
+            f"loudnorm=I={LOUDNESS['I']}:TP={LOUDNESS['TP']}:LRA={LOUDNESS['LRA']}"
+            f":measured_I={measured['input_i']}:measured_TP={measured['input_tp']}"
+            f":measured_LRA={measured['input_lra']}"
+            f":measured_thresh={measured['input_thresh']}"
+            f":offset={measured['target_offset']}:linear=true"
+        )
+    return (
+        "adeclick=w=20:o=75:a=2:t=12:b=2:m=s,"
+        f"highpass=f=55,{loudnorm},{resample_filter()},alimiter=limit=0.95,apad"
+    )
 
 
 @dataclass(frozen=True)
@@ -81,6 +158,7 @@ class Candidate:
     waveform: object
     text: str
     cfg_weight: float
+    regions: tuple = ()
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -130,7 +208,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--temperature", type=float, default=0.6, help="generation randomness (default: 0.6)")
     parser.add_argument(
         "--accent", choices=("auto", "american"), default="auto",
-        help="target pronunciation preset; american is available for English",
+        help="accepted for compatibility; validates the language and nothing more",
     )
     parser.add_argument("--seed", type=int, default=91, help="reproducible random seed (default: 91)")
     parser.add_argument(
@@ -152,6 +230,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--pause-alignment", choices=("source", "off"), default="source",
         help="match generated intra-line pauses to source speech pauses (default: source)",
+    )
+    parser.add_argument(
+        "--variant-start", choices=("predicted", "first"), default="predicted",
+        help=(
+            "which wording to synthesize first: the one predicted to fit the cue, "
+            "or always the first listed (default: predicted)"
+        ),
     )
     parser.add_argument(
         "--fit", choices=("natural", "stretch", "trim"), default="natural",
@@ -322,16 +407,51 @@ def extract_reference(source: Path, destination: Path) -> None:
 
 
 def mux_video(video: Path, audio: Path, output: Path) -> None:
+    """Copy the video bitstream untouched and master the new audio over it."""
     run_ffmpeg(
         [
             "ffmpeg", "-y", "-v", "error", "-i", str(video), "-i", str(audio),
             "-map", "0:v:0", "-map", "1:a:0", "-c:v", "copy", "-c:a", "aac",
-            "-b:a", "192k", "-ar", "48000", "-ac", "2",
-            "-af", MASTER_FILTER,
+            "-b:a", "256k", "-ar", "48000", "-ac", "2",
+            "-af", master_filter(measure_loudness(audio)),
+            "-movflags", "+faststart",
             "-shortest", str(output),
         ],
         "create dubbed video",
     )
+    verify_video_unchanged(video, output)
+
+
+def video_stream_md5(source: Path) -> str | None:
+    """Hash the video bitstream alone, ignoring container and audio."""
+    try:
+        completed = subprocess.run(
+            ["ffmpeg", "-v", "error", "-i", str(source), "-map", "0:v:0",
+             "-c", "copy", "-f", "md5", "-"],
+            capture_output=True, text=True, check=False,
+        )
+    except FileNotFoundError:
+        return None
+    output = completed.stdout.strip()
+    return output if completed.returncode == 0 and output.startswith("MD5=") else None
+
+
+def verify_video_unchanged(source: Path, output: Path) -> None:
+    """Fail loudly if muxing damaged the file or touched the video.
+
+    A filter that FFmpeg cannot configure leaves a zero-byte container behind,
+    and leaving the video bit-identical is the point of the whole tool, so both
+    are checked before the run is called a success.
+    """
+    if not output.exists() or output.stat().st_size == 0:
+        raise RuntimeError(f"muxing produced an empty file: '{output}'")
+    before, after = video_stream_md5(source), video_stream_md5(output)
+    if after is None:
+        raise RuntimeError(f"muxed file is unreadable: '{output}'")
+    if before is not None and before != after:
+        raise RuntimeError(
+            "the video stream changed during muxing; it must be copied untouched"
+        )
 
 
 def speech_intervals(waveform: object, sample_rate: int, librosa: object, np: object) -> list[tuple[float, float]]:
@@ -467,6 +587,19 @@ def align_internal_pauses(
         aligned[cursor:end] = chunk[:end - cursor]
         cursor = end + gap_samples[index + 1]
     return aligned
+
+
+def fade_edges(waveform: object, sample_rate: int, np: object,
+               fade_ms: float = 6.0) -> object:
+    """Taper both ends so an independently generated cue splices without a click."""
+    fade = min(max(1, round(sample_rate * fade_ms / 1000.0)), len(waveform) // 2)
+    if fade < 2:
+        return waveform
+    ramp = np.linspace(0.0, 1.0, fade, dtype=np.float32)
+    faded = np.array(waveform, dtype=np.float32, copy=True)
+    faded[:fade] *= ramp
+    faded[-fade:] *= ramp[::-1]
+    return faded
 
 
 def clean_pause_noise(
@@ -620,20 +753,6 @@ def estimated_translation_duration(
     return source_window * target_estimate / source_estimate
 
 
-def choose_text_for_duration(options: list[str], duration: float, language: str) -> str:
-    """Choose a non-overlong wording, accepting up to one second of spare time."""
-    estimates = [(text, estimated_spoken_duration(text, language)) for text in options]
-    # Prefer the first semantically-ranked wording that fits or is only slightly
-    # short. This preserves editorial ordering while avoiding overrun.
-    acceptable = [item for item in estimates if 0.0 <= duration - item[1] <= 1.0]
-    if acceptable:
-        return acceptable[0][0]
-    # If every wording is too long, use the shortest one as a safe fallback.
-    under = [item for item in estimates if item[1] <= duration]
-    if under:
-        return max(under, key=lambda item: item[1])[0]
-    return min(estimates, key=lambda item: item[1])[0]
-
 
 def candidate_score(candidate: Candidate) -> float:
     """Balance timing, identity, pauses, and collisions on comparable scales."""
@@ -645,18 +764,6 @@ def candidate_score(candidate: Candidate) -> float:
     )
 
 
-def choose_candidate(candidates: list[Candidate], tolerance: float) -> Candidate:
-    """Choose the best balanced take, falling back when none meet timing tolerance."""
-    if not candidates:
-        raise ValueError("cannot choose from an empty candidate list")
-    eligible = [candidate for candidate in candidates if candidate.duration_error <= tolerance]
-    if eligible:
-        pool = eligible
-    else:
-        closest_error = min(candidate.duration_error for candidate in candidates)
-        pool = [candidate for candidate in candidates if candidate.duration_error <= closest_error + 0.02]
-    return min(pool, key=lambda candidate: (candidate_score(candidate), candidate.duration_error))
-
 
 def placement_start(
     cue: Cue,
@@ -666,7 +773,6 @@ def placement_start(
     generated_regions: list[tuple[float, float]],
     previous_end: float,
     next_start: float | None,
-    tolerance: float,
     hard_end: float | None = None,
 ) -> int:
     """Align voiced onsets, borrowing free gaps without overlapping prior audio."""
@@ -916,8 +1022,6 @@ def run(args: argparse.Namespace) -> Path:
         run_metrics["device"] = device
         run_metrics["cues"] = []
     cfg_weight = args.cfg_weight
-    if cfg_weight is None:
-        cfg_weight = 0.0 if args.accent == "american" else 0.5
     if args.seed is not None:
         torch.manual_seed(args.seed)
         if torch.cuda.is_available():
@@ -1072,9 +1176,23 @@ def run(args: argparse.Namespace) -> Path:
                 cues[number].start if number < len(cues)
                 else max(cue.end, source_duration or cue.end)
             )
-            available = max(0.05, next_start - earliest_start)
-            cue_metrics["available"] = round(available, 3)
-            tried_indices = [0]
+            # The source speaks until cue.end and then may pause before the next
+            # line. Match the speech, not the pause: aim at `target`, and treat
+            # `room` only as the ceiling that must not overlap the next cue.
+            target = max(0.05, cue.end - earliest_start)
+            room = max(target, next_start - earliest_start)
+            cue_metrics["target"] = round(target, 3)
+            cue_metrics["room"] = round(room, 3)
+            first_index = 0
+            if args.variant_start == "predicted" and len(text_options) > 1:
+                scale0 = (
+                    sorted(measured_scales)[len(measured_scales) // 2]
+                    if measured_scales else 1.0
+                )
+                first_index = best_start_index(
+                    [e * scale0 for e in estimates], target, GAP_LIMIT, room
+                )
+            tried_indices = [first_index]
             candidate_indices: list[int] = []
             candidate_number = 0
             best_violation = float("inf")
@@ -1106,22 +1224,15 @@ def run(args: argparse.Namespace) -> Path:
                 pause_mismatch = (
                     abs(len(generated_regions) - source_chunk_count) if intervals else 0
                 )
-                generated_16k = librosa.resample(
-                    generated, orig_sr=sample_rate, target_sr=16000
-                )
-                embedding = model.ve.embeds_from_wavs(
-                    [generated_16k], sample_rate=16000
-                ).mean(axis=0)
-                embedding /= np.linalg.norm(embedding) + 1e-8
-                similarity = float(np.dot(reference_embedding, embedding))
                 duration_error = (
                     abs(generated_duration - original_voice_duration)
                     / original_voice_duration
                 )
-                overrun = max(0.0, generated_duration - available) / available
+                overrun = max(0.0, generated_duration - room) / room
                 candidate = Candidate(
-                    duration_error, pause_mismatch, similarity, overrun,
+                    duration_error, pause_mismatch, float("nan"), overrun,
                     generated, candidate_text, candidate_cfg,
+                    tuple(generated_regions),
                 )
                 candidates.append(candidate)
                 candidate_indices.append(text_index)
@@ -1130,21 +1241,17 @@ def run(args: argparse.Namespace) -> Path:
                     "duration": round(generated_duration, 3),
                     "duration_error": round(duration_error, 4),
                     "pause_mismatch": pause_mismatch,
-                    "voice_similarity": round(similarity, 4),
                     "overrun": round(overrun, 4),
-                    "cfg_weight": round(candidate_cfg, 3),
                     "generation_seconds": round(generation_seconds, 3),
-                    "score": round(candidate_score(candidate), 4),
                 })
                 status = "within tolerance" if duration_error <= args.duration_tolerance else "fallback"
                 print(
                     f"  measured take {candidate_number}: "
                     f"{generated_duration:.2f}s, duration error {duration_error:.1%} "
-                    f"({status}), pause mismatch {pause_mismatch}, voice score {similarity:.3f}, "
-                    f"cfg {candidate_cfg:.2f}",
+                    f"({status}), pause mismatch {pause_mismatch}",
                     file=sys.stderr,
                 )
-                violation = timing_violation(generated_duration, available, GAP_LIMIT)
+                violation = timing_violation(generated_duration, target, GAP_LIMIT, room)
                 best_violation = min(best_violation, violation)
                 # Aim retries at Chatterbox's observed pace instead of the raw
                 # text estimate, so one retry usually suffices.
@@ -1154,12 +1261,14 @@ def run(args: argparse.Namespace) -> Path:
                 )
                 calibrated = [estimate * scale for estimate in estimates]
                 retry = next_variant_index(
-                    calibrated, tried_indices, generated_duration, available, GAP_LIMIT
+                    calibrated, tried_indices, generated_duration, target, GAP_LIMIT, room
                 )
                 if retry is None:
                     continue
-                predicted = timing_violation(calibrated[retry], available, GAP_LIMIT)
-                if predicted >= best_violation:
+                predicted = timing_violation(calibrated[retry], target, GAP_LIMIT, room)
+                clearly_better = predicted + PREDICTION_MARGIN < best_violation
+                still_bad = best_violation > 2 * GAP_LIMIT
+                if not (clearly_better or still_bad):
                     # No untried wording is predicted to beat what we already
                     # have; another take would only cost generation time.
                     print(
@@ -1168,23 +1277,31 @@ def run(args: argparse.Namespace) -> Path:
                         file=sys.stderr,
                     )
                     continue
-                reason = "gap" if generated_duration < available - GAP_LIMIT else "overlap"
+                reason = "gap" if generated_duration < target - GAP_LIMIT else "overlap"
                 print(f"  {reason} violation: retrying with variant {retry + 1}", file=sys.stderr)
                 tried_indices.append(retry)
             chosen_position = min(
                 range(len(candidates)),
                 key=lambda i: (
-                    timing_violation(len(candidates[i].waveform) / sample_rate, available, GAP_LIMIT),
+                    timing_violation(len(candidates[i].waveform) / sample_rate, target, GAP_LIMIT, room),
                     candidate_indices[i],
                 ),
             )
             chosen = candidates[chosen_position]
             generated, chosen_text = chosen.waveform, chosen.text
+            chosen_16k = librosa.resample(generated, orig_sr=sample_rate, target_sr=16000)
+            chosen_embedding = model.ve.embeds_from_wavs(
+                [chosen_16k], sample_rate=16000
+            ).mean(axis=0)
+            chosen_embedding /= np.linalg.norm(chosen_embedding) + 1e-8
+            similarity = float(np.dot(reference_embedding, chosen_embedding))
+            chosen = replace(chosen, similarity=similarity)
+            print(f"  voice score {similarity:.3f}", file=sys.stderr)
             cue_metrics["selected"] = {
                 "text": chosen.text,
                 "duration_error": round(chosen.duration_error, 4),
                 "pause_mismatch": chosen.pause_mismatch,
-                "voice_similarity": round(chosen.similarity, 4),
+                "voice_similarity": round(similarity, 4),
                 "overrun": round(chosen.overrun, 4),
                 "cfg_weight": round(chosen.cfg_weight, 3),
                 "score": round(candidate_score(chosen), 4),
@@ -1195,7 +1312,7 @@ def run(args: argparse.Namespace) -> Path:
                     f"using best take ({chosen.duration_error:.1%} duration error)",
                     file=sys.stderr,
                 )
-            generated_regions = speech_intervals(generated, sample_rate, librosa, np)
+            generated_regions = list(chosen.regions)
             generated = clean_pause_noise(
                 generated, generated_regions, sample_rate, np
             )
@@ -1224,7 +1341,7 @@ def run(args: argparse.Namespace) -> Path:
                     generated,
                     chosen_text,
                     sample_rate,
-                    min(cue.end - cue.start, available) - len(generated) / sample_rate,
+                    target - len(generated) / sample_rate,
                     np,
                 )
                 if inserted_pause:
@@ -1248,11 +1365,11 @@ def run(args: argparse.Namespace) -> Path:
             if args.placement == "center":
                 start_sample = placement_start(
                     cue, len(generated), sample_rate, intervals, generated_regions,
-                    previous_audio_end / sample_rate, following_start,
-                    args.duration_tolerance, source_duration,
+                    previous_audio_end / sample_rate, following_start, source_duration,
                 )
             else:
                 start_sample = max(previous_audio_end, round(cue.start * sample_rate))
+            generated = fade_edges(generated, sample_rate, np)
             copy_count = min(slot_samples, len(generated)) if args.fit == "trim" else len(generated)
             required_samples = start_sample + copy_count
             if required_samples > len(timeline):

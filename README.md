@@ -42,9 +42,10 @@ ordered shortest to longest:
 it gets stressful, || it gets pretty stressful, || of course, it gets pretty stressful,
 ```
 
-The tool synthesizes the first wording, measures it, and only tries another if
-the result overlaps the next line or leaves more than 0.2s of dead air. The
-wording it picks is written to an SBV beside the output.
+The tool synthesizes whichever wording it predicts will fit, measures the
+result, and only tries another if that one overlaps the next line or leaves more
+than 0.2s of dead air. The wording it picks is written to an SBV beside the
+output.
 
 Useful flags:
 
@@ -53,6 +54,7 @@ Useful flags:
 | `--voice-reference PATH` | Voice to clone (default: `reference/ref-voice-best-window.wav`) |
 | `--audio-output PATH` | Also save the dub as lossless WAV |
 | `--source-language XX` | Machine-translate the captions first (lower quality than doing it yourself) |
+| `--variant-start first` | Always synthesize the first wording first, instead of the one predicted to fit |
 | `--fit stretch` | Allow 0.96x–1.04x Rubber Band time-stretching |
 | `--run-log PATH` | Where to append per-run metrics (default: beside the output) |
 

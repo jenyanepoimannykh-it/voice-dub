@@ -15,8 +15,14 @@
 - If a generated line leaves an artificial gap greater than 0.2 seconds where the original has no
   comparable gap, go back to the previous affected cue and try a longer available `||` variant;
   recalculate placements after the change.
+- Synthesis starts with the variant whose calibrated duration is predicted to fit the cue, falling
+  back to editorial order among equally good predictions (`--variant-start first` restores always
+  starting at variant 1). Prediction error is about 0.35s, so a hair-thin predicted advantage is not
+  a reason to spend another take.
 - A line is regenerated only when the measured result violates these overlap/gap restrictions. Do not
   synthesize extra variants speculatively when the current placement satisfies them.
+- Match the source's speech span, not the pause after it: aim at `cue.end`, and treat the next cue's
+  start only as the ceiling that must not be overlapped.
 - Natural mode never time-stretches generated speech. Explicit `--fit stretch` may use the fine Rubber
   Band backend in the conservative 0.96x–1.04x range; outside that range, use variants/placement.
 - Measure a cue's available room from the later of its caption start and the previous line's

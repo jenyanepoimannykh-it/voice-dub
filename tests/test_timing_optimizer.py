@@ -1,6 +1,6 @@
 import unittest
 
-from voice_dub.timing_optimizer import choose_variant_indices, next_variant_index, timing_violation
+from voice_dub.timing_optimizer import best_start_index, next_variant_index, timing_violation
 
 
 class TimingOptimizerTests(unittest.TestCase):
@@ -13,29 +13,22 @@ class TimingOptimizerTests(unittest.TestCase):
 
     def test_next_variant_moves_shorter_after_measured_overlap(self):
         self.assertEqual(next_variant_index([4.5, 5.5], [1], 5.5, 5.0), 0)
-    def test_keeps_first_variants_when_constraints_are_satisfied(self):
-        self.assertEqual(
-            choose_variant_indices([0, 5], [5, 10], [[4.5, 3.0], [4.0, 3.0]]),
-            [0, 0],
-        )
+    def test_pause_before_the_next_cue_is_not_something_to_fill(self):
+        # Source speaks 5s then pauses 1s. A 4.9s take is on target, not short,
+        # and a 5.8s take runs into the pause without overlapping the next line.
+        self.assertEqual(timing_violation(4.9, 5.0, 0.2, 6.0), 0.0)
+        self.assertEqual(timing_violation(5.8, 5.0, 0.2, 6.0), 0.0)
+        self.assertAlmostEqual(timing_violation(6.4, 5.0, 0.2, 6.0), 0.4)
+        self.assertAlmostEqual(timing_violation(4.0, 5.0, 0.2, 6.0), 0.8)
 
-    def test_uses_shorter_previous_variant_to_remove_overlap(self):
-        self.assertEqual(
-            choose_variant_indices([0, 5], [5, 10], [[6.0, 4.0], [4.0]]),
-            [1, 0],
-        )
+    def test_start_index_picks_the_first_wording_predicted_to_fit(self):
+        self.assertEqual(best_start_index([2.0, 4.9, 5.1, 7.0], 5.0), 1)
 
-    def test_uses_longer_previous_variant_to_remove_artificial_gap(self):
-        self.assertEqual(
-            choose_variant_indices([0, 8], [8, 12], [[2.0, 7.0], [3.0]]),
-            [1, 0],
-        )
+    def test_start_index_falls_back_to_the_closest_when_none_fit(self):
+        self.assertEqual(best_start_index([1.0, 2.0, 9.0], 5.0), 1)
 
-    def test_accepts_overlap_only_when_no_assignment_can_avoid_it(self):
-        self.assertEqual(
-            choose_variant_indices([0, 5], [5, 8], [[6.0], [4.0]]),
-            [0, 0],
-        )
+    def test_start_index_prefers_earlier_wording_on_a_tie(self):
+        self.assertEqual(best_start_index([4.9, 4.9, 5.0], 5.0), 0)
 
 
 if __name__ == "__main__":

@@ -7,11 +7,12 @@ import unittest
 from voice_dub.cli import (
     DEFAULT_VOICE_REFERENCE, GAP_LIMIT, MASTER_FILTER, Candidate, Cue, active_duration,
     align_internal_pauses, append_run_log, build_parser, default_voice_reference,
-    choose_candidate, choose_device, choose_text_for_duration,
+    choose_device,
     add_phrase_pauses, estimated_spoken_duration, estimated_translation_duration,
     phonetic_units, placement_start,
     clean_pause_noise, extract_text_options, format_sbv, parse_timed_text,
-    speech_only_reference,
+    speech_only_reference, fade_edges, master_filter, LOUDNESS,
+    resample_filter, verify_video_unchanged,
     refine_cue_timing, trim_to_speech,
 )
 
@@ -168,33 +169,13 @@ class CliTests(unittest.TestCase):
         cue = Cue(1.0, 5.0, "Text")
         self.assertAlmostEqual(active_duration(cue, [(0.5, 2.0), (2.5, 4.0), (6.0, 7.0)]), 2.5)
 
-    def test_chooses_closest_candidate_when_none_are_within_tolerance(self):
-        candidates = [
-            Candidate(0.40, 0, 0.9, 0.0, "long", "Long wording", 0.3),
-            Candidate(0.30, 1, 0.8, 0.0, "closest", "Closest wording", 0.3),
-        ]
-        self.assertEqual(choose_candidate(candidates, 0.25).waveform, "closest")
 
-    def test_prefers_candidate_within_tolerance(self):
-        candidates = [
-            Candidate(0.30, 0, 0.9, 0.0, "outside", "Outside wording", 0.3),
-            Candidate(0.20, 1, 0.8, 0.0, "inside", "Inside wording", 0.3),
-        ]
-        self.assertEqual(choose_candidate(candidates, 0.25).waveform, "inside")
 
     def test_estimates_phonetic_length_instead_of_character_length(self):
         self.assertEqual(phonetic_units("Naturally stressful", "en"), 6)
         self.assertGreater(estimated_spoken_duration("A considerably longer sentence", "en"), 1.0)
 
-    def test_preselects_wording_closest_to_source_duration(self):
-        options = ["Very short.", "This wording should take considerably longer to say."]
-        target = estimated_spoken_duration(options[1], "en")
-        self.assertEqual(choose_text_for_duration(options, target, "en"), options[1])
 
-    def test_duration_selection_never_prefers_overlong_wording(self):
-        options = ["A very long wording that exceeds the available window.", "Short wording."]
-        selected = choose_text_for_duration(options, 1.5, "en")
-        self.assertEqual(selected, "Short wording.")
 
     def test_translation_duration_is_source_calibrated(self):
         source = "Это короткая фраза."
@@ -206,7 +187,7 @@ class CliTests(unittest.TestCase):
         start = placement_start(
             Cue(1.0, 4.0, "Text"), generated_samples=200, sample_rate=100,
             source_regions=[(1.4, 3.8)], generated_regions=[(0.2, 1.8)],
-            previous_end=0.8, next_start=4.2, tolerance=0.25,
+            previous_end=0.8, next_start=4.2,
         )
         self.assertEqual(start, 120)
 
@@ -214,7 +195,7 @@ class CliTests(unittest.TestCase):
         start = placement_start(
             Cue(2.0, 4.0, "Text"), generated_samples=260, sample_rate=100,
             source_regions=[(2.1, 3.9)], generated_regions=[(0.1, 2.5)],
-            previous_end=1.2, next_start=4.0, tolerance=0.25,
+            previous_end=1.2, next_start=4.0,
         )
         self.assertEqual(start, 140)
 
@@ -222,7 +203,7 @@ class CliTests(unittest.TestCase):
         start = placement_start(
             Cue(2.0, 4.0, "Text"), generated_samples=150, sample_rate=100,
             source_regions=[(2.0, 3.8)], generated_regions=[(0.0, 1.4)],
-            previous_end=2.3, next_start=4.5, tolerance=0.25,
+            previous_end=2.3, next_start=4.5,
         )
         self.assertEqual(start, 230)
 
@@ -281,7 +262,7 @@ class CliTests(unittest.TestCase):
         start = placement_start(
             Cue(2.0, 4.0, "Text"), generated_samples=230, sample_rate=100,
             source_regions=[(2.0, 4.0)], generated_regions=[(0.0, 2.3)],
-            previous_end=1.0, next_start=None, tolerance=0.25, hard_end=4.6,
+            previous_end=1.0, next_start=None, hard_end=4.6,
         )
         self.assertEqual(start, 200)
 
@@ -289,7 +270,7 @@ class CliTests(unittest.TestCase):
         start = placement_start(
             Cue(2.0, 4.0, "Text"), generated_samples=300, sample_rate=100,
             source_regions=[(2.0, 4.0)], generated_regions=[(0.0, 3.0)],
-            previous_end=1.0, next_start=None, tolerance=0.25, hard_end=4.5,
+            previous_end=1.0, next_start=None, hard_end=4.5,
         )
         self.assertEqual(start, 150)
 
@@ -303,6 +284,55 @@ class CliTests(unittest.TestCase):
         cues, options = extract_text_options([Cue(1.0, 2.0, "Long wording||Short")])
         self.assertEqual(options[0], ["Long wording", "Short"])
         self.assertEqual(cues[0].text, "Long wording")
+
+    def test_two_pass_loudnorm_uses_the_measured_programme(self):
+        measured = {"input_i": "-19.1", "input_tp": "-3.2", "input_lra": "6.4",
+                    "input_thresh": "-29.3", "target_offset": "0.4"}
+        chain = master_filter(measured)
+        self.assertIn("measured_I=-19.1", chain)
+        self.assertIn("offset=0.4", chain)
+        self.assertIn("linear=true", chain)
+        self.assertIn("aresample=48000", chain)
+        self.assertIn(f"I={LOUDNESS['I']}", chain)
+
+    def test_single_pass_loudnorm_when_measurement_is_unavailable(self):
+        chain = master_filter(None)
+        self.assertNotIn("measured_I", chain)
+        self.assertIn("loudnorm=", chain)
+        self.assertIn("apad", chain)
+
+    def test_edge_fades_leave_the_interior_untouched(self):
+        import numpy as np
+
+        waveform = np.ones(1000, dtype=np.float32)
+        faded = fade_edges(waveform, sample_rate=1000, np=np, fade_ms=10)
+        self.assertEqual(faded[0], 0.0)
+        self.assertEqual(faded[-1], 0.0)
+        self.assertTrue(np.all(faded[20:980] == 1.0))
+        self.assertTrue(np.all(waveform == 1.0))
+
+    def test_resample_filter_never_requests_an_unavailable_engine(self):
+        chain = resample_filter()
+        self.assertTrue(chain.startswith("aresample=48000"))
+        if "soxr" in chain:
+            self.assertIn("precision=28", chain)
+
+    def test_empty_mux_output_is_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            out = Path(directory) / "out.mp4"
+            out.touch()
+            with self.assertRaisesRegex(RuntimeError, "empty file"):
+                verify_video_unchanged(Path(directory) / "in.mp4", out)
+
+    def test_missing_mux_output_is_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(RuntimeError, "empty file"):
+                verify_video_unchanged(Path(directory) / "in.mp4",
+                                       Path(directory) / "missing.mp4")
+
+    def test_variant_start_defaults_to_the_predicted_wording(self):
+        args = build_parser().parse_args(["v.wav", "-l", "en"])
+        self.assertEqual(args.variant_start, "predicted")
 
     def test_gap_limit_matches_the_documented_tolerance(self):
         self.assertEqual(GAP_LIMIT, 0.2)
