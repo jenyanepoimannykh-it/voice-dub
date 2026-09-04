@@ -11,6 +11,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import shutil
 from typing import Sequence
 
 
@@ -692,6 +693,27 @@ def add_phrase_pauses(
     return np.concatenate(pieces).astype(np.float32, copy=False), inserted
 
 
+def professional_time_stretch(waveform: object, rate: float, sample_rate: int, np: object) -> object:
+    """Use Rubber Band for clean speech stretching, with librosa fallback."""
+    rubberband = shutil.which("rubberband")
+    if not rubberband:
+        import librosa
+        return librosa.effects.time_stretch(waveform, rate=rate)
+    import soundfile as sf
+    work_root = Path.cwd() / ".work"
+    work_root.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="stretch-", dir=work_root) as directory:
+        source = Path(directory) / "source.wav"
+        target = Path(directory) / "target.wav"
+        sf.write(source, np.asarray(waveform, dtype=np.float32), sample_rate, subtype="PCM_16")
+        subprocess.run(
+            [rubberband, "--tempo", str(rate), "--crisp", "4", str(source), str(target)],
+            check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        stretched, _ = sf.read(target, dtype="float32")
+    return np.asarray(stretched, dtype=np.float32)
+
+
 def extract_text_options(cues: list[Cue]) -> tuple[list[Cue], list[list[str]]]:
     """Allow curated alternatives separated by ` || ` inside a timed cue."""
     primary: list[Cue] = []
@@ -1113,7 +1135,7 @@ def run(args: argparse.Namespace) -> Path:
             if args.fit == "natural" and len(generated) > round(available * sample_rate):
                 speed = min(1.03, len(generated) / max(available * sample_rate, 1))
                 if speed > 1.0:
-                    generated = librosa.effects.time_stretch(generated, rate=speed)
+                    generated = professional_time_stretch(generated, speed, sample_rate, np)
                     cue_metrics["last_resort_speedup"] = round(speed, 4)
                     print(f"  last resort: sped up take by {(speed - 1) * 100:.1f}% before overlap", file=sys.stderr)
             if should_stretch and len(generated) > slot_samples:
@@ -1123,7 +1145,7 @@ def run(args: argparse.Namespace) -> Path:
                     f"into {slot_samples / sample_rate:.2f}s (speed {rate:.2f}x)",
                     file=sys.stderr,
                 )
-                generated = librosa.effects.time_stretch(generated, rate=rate)
+                generated = professional_time_stretch(generated, rate, sample_rate, np)
             next_start = cues[number].start if number < len(cues) else None
             if args.placement == "center":
                 start_sample = placement_start(
